@@ -107,3 +107,8 @@ temp/
 *.pem
 *.key
 *.secret
+
+# ── Proyecto local (no pertenece al repo público) ────────────────────────────
+CLAUDE.md
+.claude/
+.obsidian/
