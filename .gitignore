@@ -1,31 +1,49 @@
-# Build artifacts
+# ── CMake ────────────────────────────────────────────────────────────────────
 build/
 _build/
+local_build/
 out/
-dist/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
 Makefile
 *.make
 
-# Compiled objects and binaries
+# CTest output
+Testing/
+
+# ── Compiled objects and binaries ────────────────────────────────────────────
 *.o
 *.a
 *.so
 *.dylib
 *.dll
 *.exe
+*.out
 
-# HIP / ROCm specific
-*.hsaco
-*.co
-*.gcno
-*.gcda
-*.hip.cpp
+# Linux binaries without extension (from direct hipcc invocations)
+# Convention: always compile to build/ or local_build/ — never to project root.
+# If you do compile manually, add the binary name here or use local_build/.
+
+# ── HIP / ROCm specific ──────────────────────────────────────────────────────
+*.hsaco          # HIP shader compiled object
+*.co             # code object
+*.gcno           # gcov notes (HIP coverage)
+*.gcda           # gcov data
+*.hip.cpp        # HIPIFY output
+
+# LLVM intermediate artifacts (from hipcc --save-temps or --emit-llvm)
+*.ll             # LLVM IR text
+*.bc             # LLVM bitcode
+*.amdgcn.bc      # AMD GCN bitcode
+*.s              # assembly output
+*.d              # compiler dependency files
+
 hipify-output/
 
-# Python
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -35,11 +53,16 @@ __pycache__/
 venv/
 .venv/
 env/
-.env/
 dist/
 *.whl
 
-# Profiler outputs
+# Jupyter (AMD Developer Cloud uses JupyterLab)
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Profiler outputs ─────────────────────────────────────────────────────────
+# rocprofv3 generates JSON, CSV, SQLite — exclude by default.
+# If you want to commit a specific result, use: git add -f path/to/result.json
 *.csv
 *.json
 *.db
@@ -48,7 +71,7 @@ rocprof_output/
 hsa_trace/
 *.perfetto
 
-# IDE
+# ── IDE ──────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
@@ -58,12 +81,20 @@ hsa_trace/
 *.VC.db
 *.VC.VC.opendb
 
-# OS
+# clangd LSP cache
+.cache/
+compile_commands.json
+
+# ── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Logs and temp
+# Linux core dumps
+core
+core.*
+
+# ── Logs and temp ────────────────────────────────────────────────────────────
 *.log
 *.tmp
 *.bak
@@ -71,7 +102,8 @@ desktop.ini
 tmp/
 temp/
 
-# Secrets
+# ── Secrets ──────────────────────────────────────────────────────────────────
 .env
 *.pem
 *.key
+*.secret
