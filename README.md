@@ -23,6 +23,15 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 ---
 
+## Documentation
+
+| Document | Description |
+| --- | --- |
+| [`docs/gap-analysis.md`](docs/gap-analysis.md) | Full gap analysis with per-gap status verified against AMD primary sources |
+| [`docs/research-outline.md`](docs/research-outline.md) | Research outline: hypotheses, methodology, metrics, and result placeholders — pre-registered before benchmark execution |
+
+---
+
 ## Research Areas
 
 | Area | Status | What it solves |
@@ -37,31 +46,9 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 ## Methodology
 
-Each research area follows the same process:
+Each research area follows a five-step process: confirm the gap against primary sources → survey existing implementations → implement targeting gfx942 → benchmark against the ROCm baseline (p50/p99 latency, rocprofv3 hardware counters) → contribute upstream via arXiv preprint + AMD GitHub Discussion + PR.
 
-**1. Confirm the gap**
-Verify the gap exists against AMD primary sources: GitHub issues, official documentation, ROCm source code, and peer-reviewed papers. No gap is listed without a traceable source.
-
-**2. Understand the state of the art**
-Survey existing open-source implementations (HipKittens, hipCUB, rocm-examples, Composable Kernel) to identify exactly what exists and what is missing. Build on what works; don't reinvent what doesn't need reinventing.
-
-**3. Implement**
-Develop a reference implementation targeting gfx942 (MI300X/MI300A). Code conventions:
-
-- C++17 / HIP; compiled with `hipcc --offload-arch=gfx942`
-- Wave size never assumed — always use `warpSize` (early-folded by ROCm 7 compiler)
-- Zero shared memory for wave-level primitives where possible
-- Header-only where the abstraction permits
-
-**4. Benchmark**
-Every implementation is measured against the current ROCm baseline (rocBLAS, MIOpen, RCCL, hipCUB). Results include: achieved TFLOPS vs peak, achieved bandwidth vs peak, latency p50/p99, and the hardware counter trace via `rocprofv3`. Benchmark scripts are in each area's `benchmarks/` subdirectory and are fully reproducible.
-
-**5. Contribute upstream**
-Mature implementations follow AMD's research contribution path:
-
-- Preprint published on arXiv with benchmark results
-- GitHub Discussion opened in the relevant AMD repo
-- PR submitted to `develop` branch with design document and before/after metrics
+Hypotheses are pre-registered before benchmark execution to prevent result-driven framing. For the full methodology, benchmark protocol, and per-hypothesis success criteria see [`docs/research-outline.md`](docs/research-outline.md).
 
 ---
 
@@ -87,7 +74,9 @@ Mature implementations follow AMD's research contribution path:
 
 ## Build
 
-**Requirements**: ROCm 6.2+, CMake 3.21+, Python 3.10+ (for Triton benchmarks)
+**Requirements**: ROCm 7.0+, CMake 3.21+
+
+> ROCm 7.0+ is required for `warpSize` early-fold — the compiler mechanism that enables loop unrolling without template dispatch. ROCm 7.2 is the tested version.
 
 ```bash
 git clone https://github.com/jpcpol/AMD-Incstinct-Labs.git
@@ -97,7 +86,15 @@ cmake -B build -DGPU_TARGETS=gfx942 -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-**Quick correctness test for wave-primitives** (single file, no CMake):
+**Full test + benchmark suite** (recommended on AMD Developer Cloud):
+
+```bash
+cd research/wave-primitives
+chmod +x scripts/run_all.sh
+./scripts/run_all.sh        # compiles, runs all tests and benchmarks, saves to results/
+```
+
+**Quick single-file correctness test** (no CMake):
 
 ```bash
 hipcc -O2 --offload-arch=gfx942 \
@@ -126,9 +123,9 @@ All tests passed.
 
 ## Testing on AMD Developer Cloud
 
-All research in this project can be tested on [AMD Developer Cloud](https://www.amd.com/en/developer/resources/cloud-access/amd-developer-cloud.html) — AMD's own MI300X cloud for developers. Single-GPU instances start at $1.99/hour. New accounts receive $100 in credits.
+All benchmarks in this project are designed to run on [AMD Developer Cloud](https://www.amd.com/en/developer/resources/cloud-access/amd-developer-cloud.html) — AMD's own MI300X cloud for developers ($1.99/hour per GPU). New accounts receive $100 in credits via the [AMD AI Developer Program](https://www.amd.com/en/developer/ai-dev-program.html).
 
-Recommended setup: Ubuntu 24.04 base image with ROCm 6.4, accessed via SSH.
+Recommended setup: **Vanilla ROCm** image (Ubuntu 24.04, ROCm 7.2), accessed via SSH. The full benchmark suite runs in under 10 minutes.
 
 ---
 
