@@ -108,6 +108,10 @@ temp/
 *.key
 *.secret
 
+# ── Resultados de benchmarks (opcional commitear manualmente con git add -f) ──
+local_build/
+results/
+
 # ── Proyecto local (no pertenece al repo público) ────────────────────────────
 CLAUDE.md
 .claude/

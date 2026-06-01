@@ -1,7 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
 
-# wave-primitives — header-only library + tests + benchmarks
-
 add_library(wave-primitives INTERFACE)
 target_include_directories(wave-primitives INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -10,21 +8,26 @@ target_include_directories(wave-primitives INTERFACE
 # --- Correctness test -------------------------------------------------------
 add_executable(wave_test_correctness tests/test_correctness.hip)
 target_link_libraries(wave_test_correctness PRIVATE wave-primitives hip::host)
-set_target_properties(wave_test_correctness PROPERTIES
-    HIP_ARCHITECTURES "${GPU_TARGETS}"
+set_target_properties(wave_test_correctness PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+
+# --- Benchmarks (require hipCUB) --------------------------------------------
+find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp
+    HINTS "${ROCM_PATH}/include" "/opt/rocm/include"
 )
 
-# --- Benchmark vs hipCUB ----------------------------------------------------
-find_package(hipcub QUIET HINTS "${ROCM_PATH}/include/hipcub")
+if(HIPCUB_INCLUDE_DIR)
+    message(STATUS "wave-primitives: hipCUB found at ${HIPCUB_INCLUDE_DIR} — benchmarks enabled")
 
-if(hipcub_FOUND OR EXISTS "${ROCM_PATH}/include/hipcub/hipcub.hpp")
-    add_executable(wave_bench_reduce benchmarks/bench_reduce.hip)
-    target_link_libraries(wave_bench_reduce PRIVATE wave-primitives hip::host)
-    target_include_directories(wave_bench_reduce PRIVATE "${ROCM_PATH}/include")
-    set_target_properties(wave_bench_reduce PROPERTIES
-        HIP_ARCHITECTURES "${GPU_TARGETS}"
-    )
-    message(STATUS "wave-primitives: hipCUB found — bench_reduce enabled")
+    set(BENCH_COMPILE_FLAGS -O3)
+    set(BENCH_INCLUDES wave-primitives hip::host)
+
+    foreach(bench reduce scan all_types block_reduce)
+        add_executable(wave_bench_${bench} benchmarks/bench_${bench}.hip)
+        target_link_libraries(wave_bench_${bench} PRIVATE ${BENCH_INCLUDES})
+        target_include_directories(wave_bench_${bench} PRIVATE ${HIPCUB_INCLUDE_DIR})
+        target_compile_options(wave_bench_${bench} PRIVATE ${BENCH_COMPILE_FLAGS})
+        set_target_properties(wave_bench_${bench} PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+    endforeach()
 else()
-    message(STATUS "wave-primitives: hipCUB not found — bench_reduce skipped")
+    message(STATUS "wave-primitives: hipCUB not found — benchmarks skipped (install ROCm or set ROCM_PATH)")
 endif()

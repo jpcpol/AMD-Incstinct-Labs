@@ -1,5 +1,6 @@
 #pragma once
 #include "detail/config.hpp"
+#include "wave_shuffle.hpp"
 #include <hip/hip_runtime.h>
 
 // ---------------------------------------------------------------------------
@@ -23,11 +24,7 @@ namespace wave {
 // On wave64: up to 64 bits set. On wave32/NVIDIA: up to 32 bits set.
 
 __device__ __forceinline__ wp_mask_t activemask() {
-#if WP_AMD
     return static_cast<wp_mask_t>(__activemask());
-#else
-    return static_cast<wp_mask_t>(__activemask());
-#endif
 }
 
 // --- ballot -----------------------------------------------------------------
@@ -85,6 +82,3 @@ __device__ __forceinline__ wp_mask_t lane_mask_le() {
 }
 
 } // namespace wave
-
-// Pull in lane_id dependency
-#include "wave_shuffle.hpp"

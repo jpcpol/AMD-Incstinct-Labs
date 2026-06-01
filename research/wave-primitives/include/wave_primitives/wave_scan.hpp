@@ -114,6 +114,26 @@ __device__ __forceinline__ T scan_inclusive_max(T val) {
     return val;
 }
 
+__device__ __forceinline__ __half scan_inclusive_max(__half val) {
+    float f = __half2float(val);
+    const unsigned int lid = lane_id();
+    for (int offset = 1; offset < warpSize; offset <<= 1) {
+        float other = shfl_up(f, offset);
+        if (lid >= static_cast<unsigned int>(offset)) f = max(f, other);
+    }
+    return __float2half(f);
+}
+
+__device__ __forceinline__ hip_bfloat16 scan_inclusive_max(hip_bfloat16 val) {
+    float f = __bfloat162float(val);
+    const unsigned int lid = lane_id();
+    for (int offset = 1; offset < warpSize; offset <<= 1) {
+        float other = shfl_up(f, offset);
+        if (lid >= static_cast<unsigned int>(offset)) f = max(f, other);
+    }
+    return __float2bfloat16(f);
+}
+
 template <typename T>
 __device__ __forceinline__ T scan_inclusive_min(T val) {
     const unsigned int lid = lane_id();
@@ -124,6 +144,26 @@ __device__ __forceinline__ T scan_inclusive_min(T val) {
         }
     }
     return val;
+}
+
+__device__ __forceinline__ __half scan_inclusive_min(__half val) {
+    float f = __half2float(val);
+    const unsigned int lid = lane_id();
+    for (int offset = 1; offset < warpSize; offset <<= 1) {
+        float other = shfl_up(f, offset);
+        if (lid >= static_cast<unsigned int>(offset)) f = min(f, other);
+    }
+    return __float2half(f);
+}
+
+__device__ __forceinline__ hip_bfloat16 scan_inclusive_min(hip_bfloat16 val) {
+    float f = __bfloat162float(val);
+    const unsigned int lid = lane_id();
+    for (int offset = 1; offset < warpSize; offset <<= 1) {
+        float other = shfl_up(f, offset);
+        if (lid >= static_cast<unsigned int>(offset)) f = min(f, other);
+    }
+    return __float2bfloat16(f);
 }
 
 } // namespace wave

@@ -3,7 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
-#include <limits>
+#include <type_traits>
 
 // ---------------------------------------------------------------------------
 // wave_reduce.hpp
@@ -124,6 +124,7 @@ __device__ __forceinline__ hip_bfloat16 reduce_min(hip_bfloat16 val) {
 
 template <typename T>
 __device__ __forceinline__ T reduce_and(T val) {
+    static_assert(std::is_integral<T>::value, "reduce_and requires an integer type");
     for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
         val &= shfl_down(val, offset);
     }
@@ -132,6 +133,7 @@ __device__ __forceinline__ T reduce_and(T val) {
 
 template <typename T>
 __device__ __forceinline__ T reduce_or(T val) {
+    static_assert(std::is_integral<T>::value, "reduce_or requires an integer type");
     for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
         val |= shfl_down(val, offset);
     }

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Correctness tests for wave_primitives
@@ -184,7 +185,7 @@ int main() {
         HIP_CHECK(hipMalloc(&d_out, num_blocks * wave_size * sizeof(float)));
         hipLaunchKernelGGL(kernel_scan_inclusive, dim3(num_blocks), dim3(wave_size), 0, 0, d_out);
         HIP_CHECK(hipDeviceSynchronize());
-        float h_out[64] = {};
+        std::vector<float> h_out(wave_size, 0.0f);
         HIP_CHECK(hipMemcpy(h_out, d_out, wave_size * sizeof(float), hipMemcpyDeviceToHost));
         bool pass = true;
         for (int i = 0; i < wave_size; ++i) {
@@ -206,7 +207,7 @@ int main() {
         HIP_CHECK(hipMalloc(&d_out, num_blocks * wave_size * sizeof(float)));
         hipLaunchKernelGGL(kernel_scan_exclusive, dim3(num_blocks), dim3(wave_size), 0, 0, d_out);
         HIP_CHECK(hipDeviceSynchronize());
-        float h_out[64] = {};
+        std::vector<float> h_out(wave_size, 0.0f);
         HIP_CHECK(hipMemcpy(h_out, d_out, wave_size * sizeof(float), hipMemcpyDeviceToHost));
         bool pass = true;
         for (int i = 0; i < wave_size; ++i) {
