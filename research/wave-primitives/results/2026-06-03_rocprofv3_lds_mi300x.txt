@@ -1,0 +1,34 @@
+AMD Instinct Labs — Run 2: rocprofv3 hardware counters (LDS traffic)
+MI300X VF (gfx942), ROCm 7.2.0, hipCUB 4.2.0, rocprofv3 1.1.0
+AMD Developer Cloud, 2026-06-03
+Counters: SQ_INSTS_LDS, SQ_INSTS_VALU, SQ_LDS_IDX_ACTIVE, SQ_WAVES
+Binary: bench_reduce_dpp (reduce_sum<float>, kReps=4096, 1024 blocks x 64)
+Values = average per dispatch (1000 timed dispatches per kernel).
+
+=== Measured counters per kernel ===
+Kernel                SQ_INSTS_LDS   SQ_LDS_IDX_ACTIVE   SQ_INSTS_VALU   SQ_WAVES   Latency(prof)
+bench_dpp_nobcast              0              0            37,757,952      1024      261 us
+bench_dpp_bcast                0              0            41,953,280      1024      313 us
+bench_wave (bpermute)  25,165,824    100,663,296          37,776,384      1024      978 us
+hipCUB WarpReduce       4,194,304     16,777,216          58,731,520      1024      435 us
+
+(profiler adds overhead; latencies slightly higher than un-profiled run, but
+ ratios hold: dpp_nobcast 1.67x over hipCUB, 3.74x over bpermute.)
+
+=== What this proves (MEASURED, not ISA-inferred) ===
+1. DPP reductions issue EXACTLY ZERO LDS instructions (SQ_INSTS_LDS = 0,
+   SQ_LDS_IDX_ACTIVE = 0). The "zero LDS traffic" claim is now a hardware
+   counter reading 0, not an inference from disassembly.
+2. The bpermute baseline issues 25.2M LDS instructions and 100.7M LDS-active
+   cycles — the entire latency gap traces to LDS traffic.
+3. VALU instruction count is nearly IDENTICAL between dpp_nobcast (37.76M) and
+   bpermute (37.78M). Same arithmetic work; the only difference is LDS. This
+   isolates the causal variable: the speedup is the elimination of LDS traffic,
+   not fewer arithmetic ops.
+4. hipCUB uses LDS too (4.2M insts) — 6x less than the portable baseline (hence
+   faster than it) but nonzero (hence slower than full-DPP). hipCUB also issues
+   MORE VALU (58.7M) than our full-DPP path (37.8M): we win on both LDS and VALU.
+
+=== Causal chain, now end-to-end measured ===
+__shfl_down -> ds_bpermute -> 25.2M LDS insts / 100.7M LDS-active cycles -> 978us
+full DPP    -> row_shr+row_bcast -> 0 LDS insts / 0 LDS-active cycles    -> 261us

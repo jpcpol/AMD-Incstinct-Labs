@@ -1,0 +1,40 @@
+AMD Instinct Labs — Run 2: generalized DPP reductions
+MI300X VF (gfx942), ROCm 7.2.0, HIP 7.2.26015, amdclang 22, hipCUB 4.2.0
+AMD Developer Cloud, 2026-06-03 20:33 UTC
+Clock 2100 MHz, 304 CUs, wave64
+
+=== Correctness: 12/12 PASS (sum/max/min × float/double/int32/int64) ===
+All reductions over one wave of 0..63: sum=2016, max=63, min=0. All PASS.
+64-bit DPP (double, int64) COMPILED DIRECTLY — no hi/lo split needed on amdclang 22.
+
+=== Benchmarks (kReps=4096 amortized, result on lane 63) ===
+Kernel                  Median(us)   P99(us)    Throughput
+f32 dpp::reduce_sum        231.847   237.219   1157.813 Ge/s
+f32 dpp::reduce_max        478.728   483.338    560.726 Ge/s
+f32 dpp::reduce_min        477.726   482.377    561.903 Ge/s
+f64 dpp::reduce_sum        502.823   507.714    533.857 Ge/s
+f64 dpp::reduce_max        728.134   732.505    368.662 Ge/s
+f64 dpp::reduce_min        727.172   731.623    369.150 Ge/s
+i32 dpp::reduce_sum        194.522   199.052   1379.975 Ge/s
+i32 dpp::reduce_max        193.760   197.689   1385.402 Ge/s
+i32 dpp::reduce_min        193.439   196.887   1387.701 Ge/s
+i64 dpp::reduce_sum        504.587   508.596    531.990 Ge/s
+i64 dpp::reduce_max        736.474   740.884    364.487 Ge/s
+i64 dpp::reduce_min        737.356   741.445    364.051 Ge/s
+
+=== ISA (all kernels aggregate) ===
+204x _dpp           — generic mov_dpp moves (max/min and all 64-bit)
+ 21x v_add_f64      — double sum: scalar add after dpp move (NOT fused)
+ 12x v_add_f32_dpp  — float sum: fused add+dpp (the only fused op)
+
+=== Sub-finding: only v_add_f32_dpp is a FUSED dpp op on CDNA3 ===
+- f32 sum (232µs) is ~2x faster than f32 max/min (478µs): max/min have no fused
+  v_max/min_f32_dpp, so the compiler emits mov_dpp + separate v_max/min_f32.
+- i32 sum/max/min are all ~194µs (identical): integer ops behave uniformly,
+  and i32 is the fastest type overall.
+- 64-bit (f64/i64) is ~2-2.4x slower than 32-bit: the 64-bit DPP move is split
+  into two 32-bit dpp ops by the backend.
+- ALL variants still avoid ds_bpermute (still better than the portable shuffle
+  path); the loss for max/min/64-bit is the fusion, not LDS traffic.
+
+Pending: rocprofv3 to confirm LDS traffic = 0 (measured, not just ISA-inferred).

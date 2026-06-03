@@ -1,0 +1,103 @@
+AMD Instinct Labs — Run 2: DPP scan (inclusive prefix sum)
+MI300X VF (gfx942), ROCm 7.2.0, hipCUB 4.2.0
+AMD Developer Cloud, 2026-06-03
+scan_inclusive_sum<float>, wave64, kReps=4096, 1024 blocks x 64
+
+=== Correctness ===
+dpp::scan_inclusive_sum lane63 = 64.0 (expected 64.0) PASS
+(also validated lane-by-lane in probe_scan_dpp: inclusive + exclusive ALL PASS,
+ input lane i = 1.0 → inclusive lane i = i+1, exclusive lane i = i)
+
+=== Benchmark ===
+Kernel                              Median(us)   P99(us)    Throughput   vs hipCUB
+scan portable (shfl_up/bpermute)       966.355   972.050   277.781 Ge/s   0.36x
+scan DPP-hybrid (4 DPP + 3 shfl)       392.051   400.190   684.695 Ge/s   0.90x
+hipCUB WarpScan::InclusiveSum          352.481   357.212   761.560 Ge/s   1.00x
+
+Speedup DPP vs portable: 2.465x
+Speedup DPP vs hipCUB:   0.899x  (hipCUB wins scan by ~11%)
+
+=== Key contrast: reduce vs scan ===
+- REDUCE can be FULL-DPP (row_shr + row_bcast) → 0 LDS → BEATS hipCUB 1.35-1.79x
+- SCAN can only be DPP-HYBRID (4 DPP in-row + 3 shfl for row carries) because the
+  cross-row carry needs a DISTINCT value per lane, which row_bcast cannot provide.
+  The 3 retained shfl (bpermute) keep some LDS traffic → 2.46x over portable but
+  ~11% BEHIND hipCUB.
+
+Geometry of the DPP scan (wave64, inclusive):
+  1. row_shr 1,2,4,8 (DPP) → each 16-lane row holds its own local prefix sum;
+     row totals land on lanes 15,31,47,63.
+  2. read row totals t0=shfl(15), t1=shfl(31), t2=shfl(47) BEFORE adding carry.
+  3. each lane adds the sum of all strictly-previous rows exactly once:
+     row1 +=t0; row2 +=t0+t1; row3 +=t0+t1+t2.
+Took 3 debug iterations (probe_scan_dpp lane-by-lane): first the cross-row shfl_up
+brought the wrong source lane, then staged carries double-counted; fixed by reading
+row totals up-front and applying each row's full prior-carry once.
+
+=== Implication for the thesis ===
+The DPP advantage is conditional on whether the op can eliminate ALL LDS traffic.
+Reduce: yes (beats hipCUB). Scan: partially (2.46x over naive, ~0.9x vs hipCUB).
+This refines rather than weakens the finding — it maps where the technique applies.
+
+=== Generalization (added later in Run 2) ===
+scan_inclusive generalized over type and op (templated, like reduce):
+  scan_inclusive_sum/max/min × float/int32/double/int64 → 12/12 PASS
+  (probe_scan_dpp lane-by-lane: sum input=1→lane i=i+1; max input=i→lane i=i;
+   min input=i→lane i=0).
+Two compile/correctness bugs fixed during generalization:
+  1. __builtin_amdgcn_update_dpp result for 64-bit broke Op type deduction →
+     assign to T explicitly before op() (scan_dpp_step).
+  2. Cross-row carry double-counted t0 for rows>=2 when using non-exclusive ifs
+     (v=op(v,t0) then v=op(v,op(t0,t1)) folds t0 twice) → use else-if so each
+     lane combines the carry of all previous rows exactly once.
+Carry structure (mutually exclusive per row):
+  row3 (>=48): op(v, op(op(t0,t1),t2));  row2 (>=32): op(v, op(t0,t1));
+  row1 (>=16): op(v, t0);  row0: unchanged.
+
+=== Scan benchmark across types (DPP, kReps=4096) ===
+f32  501us   f64  721us   i32  522us   i64  824us
+(scan ~2x the reduce per type — more work + retained shfl carries.)
+
+=== rocprofv3 on scan (SURPRISE — corrects an earlier assumption) ===
+Kernel          SQ_INSTS_LDS   SQ_LDS_IDX_ACTIVE   SQ_INSTS_VALU
+scan_dpp           12,582,912     50,331,648         58,737,664
+scan_portable      25,165,824    100,663,296         58,755,072
+scan_cub (hipCUB)           0              0         88,098,816   <-- ZERO LDS!
+
+hipCUB WarpScan uses ZERO LDS — it does a FULL-DPP scan, not a TempStorage scan
+as assumed. That is exactly why it beats us on scan (0.91x): hipCUB eliminated
+ALL LDS in scan; our hybrid retains 12.6M LDS insts via the 3 cross-row shfl.
+hipCUB pays with much more VALU (88M vs our 58.7M) — it does more arithmetic to
+avoid LDS, and still wins, confirming that on CDNA3 scan LDS traffic costs more
+than the extra VALU.
+
+=== Symmetry / the real rule ===
+Whoever eliminates ALL LDS wins:
+  REDUCE: we are full-DPP (0 LDS), hipCUB keeps 1 bpermute → WE WIN (1.79x).
+  SCAN:   hipCUB is full-DPP (0 LDS), we are hybrid (12.6M LDS) → THEY WIN (0.91x).
+
+=== RESOLVED (same run): FULL-DPP scan achieved, 0 LDS, beats hipCUB ===
+The hybrid was replaced by a full-DPP scan. Key insight from probe_bcast_map:
+row_bcast15 (0x142) shifts EACH row's total down to the NEXT row
+(lanes16-31<-lane15, 32-47<-lane31, 48-63<-lane47). Applying bcast15 repeatedly
+to the carry shifts a row total one more row down each time. So the accumulated
+cross-row carry is built WITHOUT shfl and WITHOUT re-reading mutated v:
+  c1  = bcast15(v)    → row1:t0, row2:t1, row3:t2
+  c1b = bcast15(c1)   → row2:t0, row3:t1
+  c1c = bcast15(c1b)  → row3:t0
+  carry: row1 = c1; row2 = c1+c1b (=t1+t0); row3 = c1+c1b+c1c (=t2+t1+t0)
+Each branch mutually exclusive in effect (masks by lane), combined once.
+
+Re-measured (full-DPP scan, MI300X VF, ROCm 7.2):
+  Speedup vs portable: 2.608x
+  Speedup vs hipCUB:   1.028x   (NOW WE WIN scan too — was 0.91x as hybrid)
+  rocprofv3: SQ_INSTS_LDS = 0 (was 12.6M as hybrid), SQ_INSTS_VALU = 71.3M.
+  Correctness re-validated: 12/12 (sum/max/min × f32/i32/f64/i64) ALL PASS.
+
+=== Thesis now complete and symmetric ===
+Full-DPP (0 LDS) wins on BOTH primitives:
+  REDUCE: full-DPP 0 LDS → 1.35-1.79x over hipCUB.
+  SCAN:   full-DPP 0 LDS → 1.028x over hipCUB (2.61x over portable).
+The rule "whoever eliminates ALL LDS traffic wins" is demonstrated by building
+both full-DPP primitives ourselves. The DPP cross-lane datapath, used fully,
+beats LDS-mediated cross-lane communication for wave64 reduction AND scan.
