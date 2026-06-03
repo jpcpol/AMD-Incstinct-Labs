@@ -1,6 +1,9 @@
 # Research Outline: Wave-Size-Agnostic Primitives for AMD CDNA3
 
-> **Status**: Pre-registration — written before benchmark results  
+> **Status**: §1–§9 pre-registered before any benchmark. §10 holds Run 1 results
+> (2026-06-03, MI300X). Hypotheses H1–H9 below are the original pre-registration,
+> unedited; §10 reports outcomes including one exploratory (non-pre-registered)
+> finding, flagged as such.  
 > **Target**: arXiv cs.DC + AMD ROCm upstream contribution  
 > **Hardware**: AMD Instinct MI300X (gfx942, ROCm 7.2)  
 > **Repository**: github.com/jpcpol/AMD-Incstinct-Labs
@@ -264,45 +267,108 @@ Submission sequence: arXiv first (no embargo), then workshop.
 
 ## 10. Results
 
-> *This section is intentionally blank. It will be completed after benchmark execution on AMD Instinct MI300X hardware.*
+> **Run 1 — 2026-06-03, AMD Developer Cloud.** First execution on real MI300X
+> hardware. This run covers the reduce-sum hypotheses (H2) and surfaced an
+> unanticipated, high-impact finding (the DPP datapath result, §10.3). The
+> scan / accuracy / block-reduce hypotheses (H1, H3, H4, H5) are deferred to a
+> follow-up run; their tables remain to be filled.
 
 ### 10.1 Environment
 
 | Field | Value |
 | --- | --- |
-| GPU | — |
-| ROCm | — |
-| Date | — |
-| Clock state | — |
+| GPU | AMD Instinct MI300X VF (gfx942, sramecc+:xnack-) |
+| CUs / Wave | 304 CUs, wave64 |
+| Clock | 2100 MHz |
+| ROCm | 7.2.0 (HIP 7.2.26015, amdclang 22) |
+| Date | 2026-06-03 |
+| Platform | AMD Developer Cloud (DigitalOcean infra) |
+| Benchmark | kReps=4096 internal loop, 1024 blocks × 64 threads, 1000 timed iters |
 
-### 10.2 H1 — Scan vs hipCUB WarpScan
+> **Methodology note (important).** The first benchmark attempt measured a flat
+> ~5.7 µs for every kernel regardless of type or algorithm — the `hipLaunchKernel`
+> latency floor, not compute. A single wave reduction (~6 VALU ops) is far below
+> that floor. All results below use an internal `kReps` repetition loop with an
+> anti-DCE dependency chain so that compute dominates. Compared kernels share an
+> identical dependency chain; the only difference is the reduction primitive.
+
+### 10.2 H2 — Reduce vs hipCUB WarpReduce (PRE-REGISTERED)
+
+| Kernel | Median (µs) | P99 (µs) | Gelems/s |
+| --- | --- | --- | --- |
+| wave::reduce_sum (portable, `__shfl_down`) | 922.5 | 927.0 | 291.0 |
+| hipCUB WarpReduce::Sum | 376.7 | 389.5 | 712.5 |
+
+Latency ratio wave/hipCUB = **2.45×** (wave is 2.45× slower).
+
+**Outcome: REFUTED.** H2 predicted parity within ±5% (falsification at >10%).
+The portable path is 145% slower than hipCUB — far outside the falsification
+bound, and in the unfavorable direction. The pre-registered rationale ("both
+use `__shfl_down` for the same number of iterations, expect ISA convergence")
+was wrong: ISA inspection shows the two do **not** converge (see §10.3).
+
+### 10.3 Exploratory finding — DPP vs ds_bpermute (NOT pre-registered)
+
+> This finding was **not** in the pre-registration. It emerged from
+> investigating *why* H2 was refuted, and is reported as exploratory. It is the
+> most consequential result of the run and reframes the project's thesis.
+
+**Root cause of the H2 refutation (verified by ISA inspection, gfx942):**
+
+| Implementation | Reduction ISA (6 steps, wave64) |
+| --- | --- |
+| wave::reduce_sum (portable) | 6× `ds_bpermute_b32` — every step round-trips through LDS |
+| hipCUB WarpReduce::Sum | 6× `v_add_f32_dpp` + 1× `ds_bpermute` (bank cross) |
+
+The generic HIP `__shfl_down` lowers to `ds_bpermute_b32`, sending each step
+through Local Data Share. hipCUB uses the DPP (Data-Parallel Primitives)
+cross-lane datapath, where the VALU reads a neighbor lane's register directly.
+
+**Intervention — `wave::dpp::reduce_sum` (full-DPP, zero LDS):** a reduction
+that stays entirely on the DPP datapath. Stages: `row_shr` (0x111/112/114/118)
+for the four in-row steps (per-row sums on lanes 15/31/47/63), then `row_bcast15`
+(0x142) and `row_bcast31` (0x143) for the row- and bank-boundary crosses. All
+DPP control codes were verified empirically lane-by-lane (`probe_dpp*.hip`).
+
+| Kernel | Median (µs) | P99 (µs) | Gelems/s | vs hipCUB |
+| --- | --- | --- | --- | --- |
+| wave::reduce_sum (bpermute baseline) | 922.5 | 927.0 | 291.0 | 0.41× |
+| wave::dpp (full, result on all lanes via readlane) | 279.0 | 284.2 | 962.3 | **1.35×** |
+| wave::dpp (full, result on lane 63, no broadcast) | 210.0 | 231.1 | 1278.0 | **1.79×** |
+| hipCUB WarpReduce::Sum | 376.7 | 389.5 | 712.5 | 1.00× |
+
+ISA of `wave::dpp` (no broadcast): **6× `v_add_f32_dpp`, 0× `ds_bpermute`** —
+100% DPP datapath, zero LDS traffic. hipCUB still emits 1 `ds_bpermute` for the
+bank cross; we avoid it with `row_bcast31`.
+
+**Result: the full-DPP reduction beats hipCUB by 1.35× (broadcast, fair
+apples-to-apples) to 1.79× (result left on lane 63), and beats the portable
+shuffle path by 4.39×.** Correctness verified: sum of 0..63 = 2016 on lane 63.
+
+### 10.4 H1 — Scan vs hipCUB WarpScan (DEFERRED)
 
 | Kernel | Median (µs) | P99 (µs) | Gelems/s |
 | --- | --- | --- | --- |
 | wave::scan_inclusive_sum | — | — | — |
 | hipCUB WarpScan::InclusiveSum | — | — | — |
 
-Outcome: [ CONFIRMED / REFUTED / INCONCLUSIVE ]
+Outcome: [ DEFERRED to Run 2 ]. Note: the DPP finding (§10.3) likely applies to
+scan as well — `scan_inclusive_sum` is built on the same `shfl_up`/`shfl_down`
+that lowers to bpermute. A DPP-based scan is a prime candidate for Run 2.
 
-### 10.3 H2 — Reduce vs hipCUB WarpReduce
-
-| Kernel | Median (µs) | P99 (µs) | Gelems/s |
-| --- | --- | --- | --- |
-| wave::reduce_sum float | — | — | — |
-| hipCUB WarpReduce::Sum | — | — | — |
-
-Outcome: [ CONFIRMED / REFUTED / INCONCLUSIVE ]
-
-### 10.4 H3 — Float32 accumulation overhead
+### 10.5 H3 — Float32 accumulation overhead (DEFERRED)
 
 | Strategy | Median (µs) | Error vs expected |
 | --- | --- | --- |
 | wave::reduce_sum __half (fp32 acc) | — | — |
 | Naive fp16 reduce | — | — |
 
-Outcome: [ CONFIRMED / REFUTED / INCONCLUSIVE ]
+Outcome: [ DEFERRED to Run 2 ]. (Run 1's launch-bound first pass showed fp32-acc
+and naive fp16 producing identical accuracy on the 64×0.1f input, error 0.0016
+each — but that was at the launch-bound regime; a kReps-amortized re-run is needed
+for a valid latency comparison.)
 
-### 10.5 H4 — Block reduce vs hipCUB BlockReduce
+### 10.6 H4 — Block reduce vs hipCUB BlockReduce (DEFERRED)
 
 | Block size | wave (µs) | hipCUB (µs) | Ratio |
 | --- | --- | --- | --- |
@@ -311,18 +377,47 @@ Outcome: [ CONFIRMED / REFUTED / INCONCLUSIVE ]
 | 512 | — | — | — |
 | 1024 | — | — | — |
 
-Outcome: [ CONFIRMED / REFUTED / INCONCLUSIVE ]
+Outcome: [ DEFERRED to Run 2 ].
 
-### 10.6 H5 — ISA unroll verification
+### 10.7 H5 — ISA unroll verification (PARTIALLY ADDRESSED)
 
-Reduction instruction count: —  
-Branch instructions in reduction sequence: —  
-Outcome: [ CONFIRMED / REFUTED ]
+The reduction loop unrolls to exactly 6 steps with **no branch instructions** in
+the reduction sequence, for both the portable and DPP kernels — consistent with
+ROCm 7 `warpSize` early-fold. (Note: `llvm-objdump` is not at `/opt/rocm/bin/`;
+ISA was obtained via `hipcc --save-temps` producing the gfx942 `.s` directly.)
 
-### 10.7 Discussion
+Outcome: **CONFIRMED** (6-step unroll, zero branches), though the original H5
+framing assumed `ds_swizzle`; the actual lowering is `ds_bpermute` (portable) /
+`v_add_f32_dpp` (DPP). The early-fold claim holds; the instruction identity differs.
 
-*To be written after results.*
+### 10.8 Discussion
 
-### 10.8 Conclusions
+The headline result inverts the project's working thesis. We set out to show a
+header-only wave-primitive library could *match* hipCUB. Run 1 first showed the
+naive portable path losing badly (2.45×), then traced the cause to a concrete,
+fixable ISA defect: the generic HIP `__shfl_down` does not use CDNA3's DPP
+datapath and pays an LDS round-trip on every reduction step. Implementing the
+reduction directly on DPP — including `row_bcast` for the boundary crosses that
+even hipCUB handles with a residual `ds_bpermute` — produces a header-only
+primitive that *outperforms* hipCUB by 1.35–1.79×.
 
-*To be written after results.*
+This is a portability-and-performance finding with direct upstream relevance:
+any ROCm code that reduces via `__shfl_down` (much of the PyTorch/JAX/vLLM HIP
+port surface) leaves this speedup on the table. The fix is local and composable.
+
+Threats to validity: (1) single hardware point (MI300X VF, virtualized); (2)
+the microbenchmark amortizes launch overhead with a synthetic dependency chain —
+the production-relevant figure is the speedup embedded in a real kernel, deferred
+to future work; (3) the DPP finding is exploratory (post-hoc), not pre-registered,
+and is reported as such.
+
+### 10.9 Conclusions
+
+1. The portable `__shfl_down`-based wave reduction is 2.45× slower than hipCUB on
+   MI300X because it lowers to `ds_bpermute` (LDS round-trip), not DPP. **(H2 refuted.)**
+2. A full-DPP reduction (`wave::dpp::reduce_sum`) using `row_shr` + `row_bcast15/31`
+   stays entirely on the DPP datapath (6× `v_add_f32_dpp`, 0× bpermute) and beats
+   hipCUB by **1.35× (broadcast) / 1.79× (lane-63 result)**, and the portable path
+   by **4.39×**. Verified correct, verified in ISA. **(Exploratory.)**
+3. Next run: extend DPP to `reduce_max`/`min`, `double`/`int32`/`int64`, build a
+   DPP-based `scan`, and complete the deferred H1/H3/H4 tables.

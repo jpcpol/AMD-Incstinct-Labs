@@ -49,8 +49,8 @@ __device__ __forceinline__ __half shfl(__half val, int src_lane, int width = war
 }
 
 __device__ __forceinline__ hip_bfloat16 shfl(hip_bfloat16 val, int src_lane, int width = warpSize) {
-    float f = shfl(__bfloat162float(val), src_lane, width);
-    return __float2bfloat16(f);
+    float f = shfl(float(val), src_lane, width);
+    return hip_bfloat16(f);
 }
 
 // --- shfl_down (shift lanes toward higher lane IDs) -------------------------
@@ -70,8 +70,8 @@ __device__ __forceinline__ __half shfl_down(__half val, unsigned int delta, int 
 }
 
 __device__ __forceinline__ hip_bfloat16 shfl_down(hip_bfloat16 val, unsigned int delta, int width = warpSize) {
-    float f = shfl_down(__bfloat162float(val), delta, width);
-    return __float2bfloat16(f);
+    float f = shfl_down(float(val), delta, width);
+    return hip_bfloat16(f);
 }
 
 // --- shfl_up (shift lanes toward lower lane IDs) ----------------------------
@@ -91,8 +91,8 @@ __device__ __forceinline__ __half shfl_up(__half val, unsigned int delta, int wi
 }
 
 __device__ __forceinline__ hip_bfloat16 shfl_up(hip_bfloat16 val, unsigned int delta, int width = warpSize) {
-    float f = shfl_up(__bfloat162float(val), delta, width);
-    return __float2bfloat16(f);
+    float f = shfl_up(float(val), delta, width);
+    return hip_bfloat16(f);
 }
 
 // --- shfl_xor (XOR lane mask — butterfly patterns) --------------------------
@@ -112,8 +112,8 @@ __device__ __forceinline__ __half shfl_xor(__half val, int lane_mask, int width 
 }
 
 __device__ __forceinline__ hip_bfloat16 shfl_xor(hip_bfloat16 val, int lane_mask, int width = warpSize) {
-    float f = shfl_xor(__bfloat162float(val), lane_mask, width);
-    return __float2bfloat16(f);
+    float f = shfl_xor(float(val), lane_mask, width);
+    return hip_bfloat16(f);
 }
 
 } // namespace wave

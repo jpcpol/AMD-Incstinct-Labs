@@ -186,7 +186,7 @@ int main() {
         hipLaunchKernelGGL(kernel_scan_inclusive, dim3(num_blocks), dim3(wave_size), 0, 0, d_out);
         HIP_CHECK(hipDeviceSynchronize());
         std::vector<float> h_out(wave_size, 0.0f);
-        HIP_CHECK(hipMemcpy(h_out, d_out, wave_size * sizeof(float), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(h_out.data(), d_out, wave_size * sizeof(float), hipMemcpyDeviceToHost));
         bool pass = true;
         for (int i = 0; i < wave_size; ++i) {
             if (fabsf(h_out[i] - static_cast<float>(i + 1)) > 0.5f) {
@@ -208,7 +208,7 @@ int main() {
         hipLaunchKernelGGL(kernel_scan_exclusive, dim3(num_blocks), dim3(wave_size), 0, 0, d_out);
         HIP_CHECK(hipDeviceSynchronize());
         std::vector<float> h_out(wave_size, 0.0f);
-        HIP_CHECK(hipMemcpy(h_out, d_out, wave_size * sizeof(float), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(h_out.data(), d_out, wave_size * sizeof(float), hipMemcpyDeviceToHost));
         bool pass = true;
         for (int i = 0; i < wave_size; ++i) {
             if (fabsf(h_out[i] - static_cast<float>(i)) > 0.5f) {

@@ -55,11 +55,11 @@ __device__ __forceinline__ __half reduce_sum(__half val) {
 
 // hip_bfloat16: same strategy.
 __device__ __forceinline__ hip_bfloat16 reduce_sum(hip_bfloat16 val) {
-    float f = __bfloat162float(val);
+    float f = float(val);
     for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
         f += shfl_down(f, offset);
     }
-    return __float2bfloat16(f);
+    return hip_bfloat16(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,11 +83,11 @@ __device__ __forceinline__ __half reduce_max(__half val) {
 }
 
 __device__ __forceinline__ hip_bfloat16 reduce_max(hip_bfloat16 val) {
-    float f = __bfloat162float(val);
+    float f = float(val);
     for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
         f = max(f, shfl_down(f, offset));
     }
-    return __float2bfloat16(f);
+    return hip_bfloat16(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -111,11 +111,11 @@ __device__ __forceinline__ __half reduce_min(__half val) {
 }
 
 __device__ __forceinline__ hip_bfloat16 reduce_min(hip_bfloat16 val) {
-    float f = __bfloat162float(val);
+    float f = float(val);
     for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
         f = min(f, shfl_down(f, offset));
     }
-    return __float2bfloat16(f);
+    return hip_bfloat16(f);
 }
 
 // ---------------------------------------------------------------------------

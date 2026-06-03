@@ -21,7 +21,7 @@ if(HIPCUB_INCLUDE_DIR)
     set(BENCH_COMPILE_FLAGS -O3)
     set(BENCH_INCLUDES wave-primitives hip::host)
 
-    foreach(bench reduce scan all_types block_reduce)
+    foreach(bench reduce scan all_types block_reduce reduce_dpp reduce_dpp_types)
         add_executable(wave_bench_${bench} benchmarks/bench_${bench}.hip)
         target_link_libraries(wave_bench_${bench} PRIVATE ${BENCH_INCLUDES})
         target_include_directories(wave_bench_${bench} PRIVATE ${HIPCUB_INCLUDE_DIR})

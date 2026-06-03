@@ -62,7 +62,7 @@ __device__ __forceinline__ __half scan_inclusive_sum(__half val) {
 }
 
 __device__ __forceinline__ hip_bfloat16 scan_inclusive_sum(hip_bfloat16 val) {
-    float f = __bfloat162float(val);
+    float f = float(val);
     const unsigned int lid = lane_id();
     for (int offset = 1; offset < warpSize; offset <<= 1) {
         float other = shfl_up(f, offset);
@@ -70,7 +70,7 @@ __device__ __forceinline__ hip_bfloat16 scan_inclusive_sum(hip_bfloat16 val) {
             f += other;
         }
     }
-    return __float2bfloat16(f);
+    return hip_bfloat16(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ __device__ __forceinline__ __half scan_exclusive_sum(__half val) {
 __device__ __forceinline__ hip_bfloat16 scan_exclusive_sum(hip_bfloat16 val) {
     hip_bfloat16 inclusive = scan_inclusive_sum(val);
     hip_bfloat16 exclusive = shfl_up(inclusive, 1);
-    return (lane_id() == 0) ? __float2bfloat16(0.0f) : exclusive;
+    return (lane_id() == 0) ? hip_bfloat16(0.0f) : exclusive;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,13 +125,13 @@ __device__ __forceinline__ __half scan_inclusive_max(__half val) {
 }
 
 __device__ __forceinline__ hip_bfloat16 scan_inclusive_max(hip_bfloat16 val) {
-    float f = __bfloat162float(val);
+    float f = float(val);
     const unsigned int lid = lane_id();
     for (int offset = 1; offset < warpSize; offset <<= 1) {
         float other = shfl_up(f, offset);
         if (lid >= static_cast<unsigned int>(offset)) f = max(f, other);
     }
-    return __float2bfloat16(f);
+    return hip_bfloat16(f);
 }
 
 template <typename T>
@@ -157,13 +157,13 @@ __device__ __forceinline__ __half scan_inclusive_min(__half val) {
 }
 
 __device__ __forceinline__ hip_bfloat16 scan_inclusive_min(hip_bfloat16 val) {
-    float f = __bfloat162float(val);
+    float f = float(val);
     const unsigned int lid = lane_id();
     for (int offset = 1; offset < warpSize; offset <<= 1) {
         float other = shfl_up(f, offset);
         if (lid >= static_cast<unsigned int>(offset)) f = min(f, other);
     }
-    return __float2bfloat16(f);
+    return hip_bfloat16(f);
 }
 
 } // namespace wave

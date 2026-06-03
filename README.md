@@ -36,11 +36,35 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 | Area | Status | What it solves |
 | --- | --- | --- |
-| [wave-primitives](research/wave-primitives/) | In progress | Header-only library: correct `reduce`, `scan`, `ballot`, `shuffle` for both wave32 (RDNA/NVIDIA) and wave64 (CDNA) |
+| [wave-primitives](research/wave-primitives/) | **Validated on MI300X** | Header-only library: correct `reduce`, `scan`, `ballot`, `shuffle` for both wave32 (RDNA/NVIDIA) and wave64 (CDNA). DPP-based reduction **beats hipCUB by 1.35–1.79×** — see Key Result below. |
 | [flash-attention-mi300x](research/flash-attention-mi300x/) | In progress | Flash Attention using DME async prefetch to overlap HBM loads with MFMA compute; FA3-style pipelining for AMD |
 | [infinity-fabric-allreduce](research/infinity-fabric-allreduce/) | Planned | Topology-aware AllReduce that uses all 7 Infinity Fabric links simultaneously instead of serializing through a ring |
 | [dme-abstraction](research/dme-abstraction/) | Planned | C++ API over the CDNA3 Data Movement Engine — the only CDNA3 feature with no NVIDIA equivalent and no usable interface |
 | [mlir-mfma-tiling](research/mlir-mfma-tiling/) | Planned | MLIR pass for automatic MFMA tile-size selection: analyze GEMM shape → select variant → emit optimal tiled code |
+
+---
+
+## Key Result (MI300X, ROCm 7.2, 2026-06-03)
+
+A header-only wave reduction can **outperform hipCUB** by using the CDNA3 DPP
+datapath directly instead of the generic `__shfl_down` lowering.
+
+| Reduction (`reduce_sum<float>`, wave64) | Median latency | vs hipCUB |
+| --- | --- | --- |
+| `wave::reduce_sum` — portable `__shfl_down` (lowers to 6× `ds_bpermute`, LDS) | 922 µs | 0.41× |
+| **`wave::dpp::reduce_sum` — full DPP (6× `v_add_f32_dpp`, 0× bpermute)** | **210–279 µs** | **1.35–1.79×** |
+| hipCUB `WarpReduce::Sum` | 377 µs | 1.00× |
+
+**Why:** the generic HIP `__shfl_down` round-trips every reduction step through
+Local Data Share (`ds_bpermute`). The DPP path keeps the entire 6-step wave64
+reduction on the cross-lane VALU datapath — including the row- and bank-boundary
+crosses via `row_bcast15`/`row_bcast31`, which even hipCUB handles with a residual
+`ds_bpermute`. Verified by ISA inspection and lane-by-lane correctness on real
+MI300X hardware. Any ROCm code reducing via `__shfl_down` (much of the
+PyTorch/JAX/vLLM HIP surface) leaves this speedup unclaimed.
+
+Full data, methodology, and the (refuted) pre-registered hypothesis that led here:
+[`docs/research-outline.md` §10](docs/research-outline.md).
 
 ---
 
@@ -133,7 +157,7 @@ Recommended setup: **Vanilla ROCm** image (Ubuntu 24.04, ROCm 7.2), accessed via
 
 This project does not replace hipCUB, Composable Kernel, or MIOpen. It targets the gaps those libraries leave:
 
-- **hipCUB**: excellent block-level primitives, but does not provide a standalone wave-level API correct for both wave32 and wave64
+- **hipCUB**: excellent block- and warp-level primitives, but does not provide a standalone *header-only* wave-level API correct for both wave32 and wave64. Its `WarpReduce` uses the DPP datapath yet still emits a residual `ds_bpermute` for the 32-lane bank cross; our full-DPP reduction avoids it (`row_bcast31`) and is 1.35–1.79× faster on MI300X (see Key Result)
 - **Composable Kernel**: high-performance GEMM and attention kernels, but no public DME abstraction layer
 - **RCCL**: functional AllReduce, but Ring/Tree topology assumptions leave bandwidth on the table for Infinity Fabric full-mesh clusters
 - **HipKittens** (HazyResearch, 2025): tile-level framework for GEMM/attention, does not expose wave-level primitives

@@ -71,19 +71,19 @@ __global__ void kernel_reduce_half_naive(const __half* in, float* out) {
 __global__ void kernel_reduce_bf16_fp32acc(const hip_bfloat16* in, float* out) {
     hip_bfloat16 val = in[blockIdx.x * blockDim.x + threadIdx.x];
     hip_bfloat16 sum = wave::reduce_sum(val);
-    if (wave::lane_id() == 0) out[blockIdx.x] = __bfloat162float(sum);
+    if (wave::lane_id() == 0) out[blockIdx.x] = float(sum);
 }
 
 // bfloat16 naive — raw shfl_down, no float promotion
 __global__ void kernel_reduce_bf16_naive(const hip_bfloat16* in, float* out) {
-    float val = __bfloat162float(in[blockIdx.x * blockDim.x + threadIdx.x]);
+    float val = float(in[blockIdx.x * blockDim.x + threadIdx.x]);
     // naive: reduce in bf16 precision by converting back each step
     for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
-        hip_bfloat16 a = __float2bfloat16(val);
+        hip_bfloat16 a = hip_bfloat16(val);
         hip_bfloat16 b = wave::shfl_down(a, offset);
-        val = __bfloat162float(a) + __bfloat162float(b);
+        val = float(a) + float(b);
         // convert back to bf16 to simulate precision loss
-        val = __bfloat162float(__float2bfloat16(val));
+        val = float(hip_bfloat16(val));
     }
     if (wave::lane_id() == 0) out[blockIdx.x] = val;
 }
@@ -167,7 +167,7 @@ int main() {
         std::vector<int>          h_i32(total, 1);
         std::vector<long long>    h_i64(total, 1LL);
         std::vector<__half>       h_f16(total, __float2half(1.0f));
-        std::vector<hip_bfloat16> h_bf16(total, __float2bfloat16(1.0f));
+        std::vector<hip_bfloat16> h_bf16(total, hip_bfloat16(1.0f));
 
         HIP_CHECK(hipMemcpy(d_in_f32,  h_f32.data(),  total * sizeof(float),        hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_in_f64,  h_f64.data(),  total * sizeof(double),       hipMemcpyHostToDevice));

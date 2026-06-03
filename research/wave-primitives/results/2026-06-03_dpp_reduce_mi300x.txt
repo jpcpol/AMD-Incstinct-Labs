@@ -1,0 +1,43 @@
+AMD Instinct Labs — DPP reduce benchmark (FINAL)
+MI300X VF (gfx942), ROCm 7.2, AMD Developer Cloud
+Date: 2026-06-03
+Clock: 2100 MHz, 304 CUs, wave64
+
+=== Correctness (single reduce over one wave, expected 2016) ===
+  wave::reduce_sum            got 2016.0  PASS
+  wave::dpp::reduce_sum_bcast got 2016.0  PASS
+
+=== reduce_sum float — bpermute vs DPP(full) vs hipCUB (kReps=4096 amortized) ===
+Kernel                                 Median(us)    P99(us)       Throughput
+wave::reduce_sum (bpermute)               922.499    927.031       290.987 Ge/s
+wave::dpp (full, +bcast)                  278.955    284.206       962.289 Ge/s
+wave::dpp (full, no bcast)                210.037    231.086      1278.039 Ge/s
+hipCUB WarpReduce::Sum                    376.737    389.486       712.527 Ge/s
+
+Speedup dpp_nobcast vs bpermute: 4.392x
+Speedup dpp_nobcast vs hipCUB:   1.794x  (WE BEAT hipCUB)
+Speedup dpp_bcast   vs hipCUB:   1.351x  (fair comparison, result on all lanes)
+
+=== ISA instruction counts (gfx942) ===
+wave::reduce_sum (bpermute):     6x ds_bpermute_b32 + 6x v_add_f32_e32
+wave::dpp (full, no bcast):      6x v_add_f32_dpp + 0x ds_bpermute   <-- 100% DPP, zero LDS
+wave::dpp (full, +bcast):        6x v_add_f32_dpp + 1x v_readlane_b32
+hipCUB WarpReduce::Sum:          6x v_add_f32_dpp (+1 ds_bpermute)
+
+=== Full-DPP reduction geometry (wave64, result on lane 63) ===
+Stage A — row_shr 1,2,4,8 (dpp_ctrl 0x111,0x112,0x114,0x118):
+          per-row sums accumulate on the HIGH lane of each 16-lane row
+          (lanes 15,31,47,63).
+Stage B — row_bcast15 (0x142): lane15->[16..31], lane31->[32..47], lane47->[48..63];
+          add propagates row sums up across row boundaries.
+Stage C — row_bcast31 (0x143): lane31->[32..63]; add completes the 32-lane bank cross.
+Result: full sum on lane 63. reduce_sum_bcast adds readlane(63) to broadcast to all.
+All DPP control codes verified empirically (probe_dpp.hip, probe_dpp_bcast.hip,
+probe_fulldpp.hip): lane-by-lane mapping confirmed, total = 2016 on lane 63.
+
+=== Mechanism / why it wins ===
+The generic HIP __shfl_down lowers to ds_bpermute_b32 — every reduction step
+makes an LDS roundtrip. hipCUB uses DPP but still emits 1 bpermute for the
+bank cross. Our full-DPP path uses row_bcast15/31 for the cross-boundary steps,
+keeping the entire 6-step reduction on the DPP datapath with zero LDS traffic.
+That is the source of the 4.39x over the portable path and 1.79x over hipCUB.
