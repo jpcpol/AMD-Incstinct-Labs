@@ -46,26 +46,31 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 ## Key Result (MI300X VF, ROCm 7.2, 2026-06-03 — bounded experimental claim)
 
-For a **float32 wave64 reduction** under one specific configuration, a header-only
-reduction on the CDNA3 DPP datapath measured faster than hipCUB `WarpReduce::Sum`:
+For **wave64 reduction and scan** under a specific configuration, header-only
+primitives on the CDNA3 DPP datapath measured faster than hipCUB — with **zero
+LDS traffic confirmed by rocprofv3**:
 
-| Reduction (`reduce_sum<float>`, wave64) | Median latency | vs hipCUB |
-| --- | --- | --- |
-| `wave::reduce_sum` — portable `__shfl_down` (6× `ds_bpermute`, LDS) | 922 µs | 0.41× |
-| **`wave::dpp::reduce_sum` — full DPP (6× `v_add_f32_dpp`, 0× bpermute)** | **210–279 µs** | **1.35–1.79×** |
-| hipCUB `WarpReduce::Sum` | 377 µs | 1.00× |
+| Primitive (`<float>`, wave64) | DPP median | vs hipCUB | LDS (measured) |
+| --- | --- | --- | --- |
+| `wave::dpp::reduce_sum` (full DPP) | 210–279 µs | **1.35–1.79×** | **0** |
+| `wave::dpp::scan_inclusive_sum` (full DPP) | 343 µs | **1.028×** | **0** |
+| (portable `__shfl` baselines) | 922 / 966 µs | 0.36–0.41× | 25.2M |
+| (hipCUB WarpReduce / WarpScan) | 377 / 352 µs | 1.00× | 4.2M / 0 |
 
-**Why (the part that generalizes):** the generic HIP `__shfl_down` routes every
-reduction step through Local Data Share (`ds_bpermute`). The DPP path keeps the
-6-step wave64 reduction on the cross-lane VALU datapath — including the row- and
-bank-boundary crosses via `row_bcast15`/`row_bcast31`, which even hipCUB handles
-with a residual `ds_bpermute`. The architectural causal chain (`__shfl_down →
-ds_bpermute → LDS traffic → latency`) is verified by ISA instruction counts and
-lane-by-lane correctness.
+Generalized across **float/double/int32/int64 × sum/max/min** (12/12 correct).
 
-**What this is and isn't.** This is a *bounded* result: one operation, one type,
-one size, on a **virtualized** MI300X, with the hipCUB version not yet recorded.
-It is **not** a general "we beat hipCUB" claim. Open items before strengthening it
+**Why (the part that generalizes):** the generic HIP `__shfl_*` routes every
+cross-lane step through Local Data Share (`ds_bpermute`). The DPP path keeps the
+whole wave64 operation on the cross-lane VALU datapath — in-row via `row_shr`,
+cross-row/bank via `row_bcast` cascades — reaching **zero `ds_bpermute`**.
+rocprofv3 measures `SQ_INSTS_LDS = 0` for both DPP primitives vs 25.2M for the
+portable path, with near-identical VALU — isolating LDS elimination as the cause.
+The unifying rule: *whoever removes all LDS-mediated cross-lane traffic wins on
+CDNA3 wave64* — true for reduce (we beat hipCUB) and scan (we edge it).
+
+**What this is and isn't.** Still a *bounded* result: a **virtualized** MI300X,
+clocks unpinned, and CDNA3-vs-gfx942 generality untested (no MI250/RDNA3 access).
+It is **not** a blanket "we beat hipCUB" claim. Open items before strengthening it
 — other types, rocprofv3 LDS-traffic counters, and CDNA3-vs-gfx942 hardware
 generality — are tracked in [`docs/research-outline.md` §10.10](docs/research-outline.md).
 That said, any ROCm code reducing via `__shfl_down` (much of the PyTorch/JAX/vLLM

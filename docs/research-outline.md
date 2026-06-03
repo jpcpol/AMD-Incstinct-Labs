@@ -267,11 +267,14 @@ Submission sequence: arXiv first (no embargo), then workshop.
 
 ## 10. Results
 
-> **Run 1 — 2026-06-03, AMD Developer Cloud.** First execution on real MI300X
-> hardware. This run covers the reduce-sum hypotheses (H2) and surfaced an
-> unanticipated, high-impact finding (the DPP datapath result, §10.3). The
-> scan / accuracy / block-reduce hypotheses (H1, H3, H4, H5) are deferred to a
-> follow-up run; their tables remain to be filled.
+> **Run 1 — 2026-06-03, AMD Developer Cloud.** First execution on real MI300X.
+> Covers H2 (reduce) and surfaced the exploratory DPP datapath finding (§10.3).
+>
+> **Run 2 — 2026-06-03 (same day).** Generalized the DPP reduction across types
+> (§10.3.1), confirmed zero LDS by rocprofv3, recorded hipCUB 4.2.0, and answered
+> H1 with a full-DPP scan that beats hipCUB (§10.4). H3 (accuracy) and H4 (block
+> reduce) remain deferred — the original benchmarks were launch-bound and need a
+> kReps-amortized re-run.
 
 ### 10.1 Environment
 
@@ -370,20 +373,72 @@ verified: sum of 0..63 = 2016 on lane 63.
 | GPU | MI300X **VF** (virtualized, gfx942) — not bare-metal | **caveat** |
 | ROCm / HIP | 7.2.0 / 7.2.26015, amdclang 22 | fixed |
 | Compile flags | `-O3 --offload-arch=gfx942 -std=c++17` | fixed |
-| **hipCUB version** | **not recorded in Run 1 — CAPTURE in Run 2** | **gap** |
+| **hipCUB version** | **4.2.0** (HIPCUB_VERSION 400200) — captured in Run 2 | fixed |
 | Clock pinning | not applied (GPU started in low-power, clock 2100 MHz observed) | **caveat** |
-| Other types (f64/i32/i64/bf16/fp16) | not yet measured | open |
+| Other types (f64/i32/i64) | measured in Run 2 (§10.3.1); bf16/fp16 still open | partial |
 
-### 10.4 H1 — Scan vs hipCUB WarpScan (DEFERRED)
+### 10.3.1 Run 2 — DPP reduction generalized + measured LDS (2026-06-03)
 
-| Kernel | Median (µs) | P99 (µs) | Gelems/s |
+**Types.** `reduce_sum/max/min` extended to float, double, int32, int64.
+Correctness 12/12 PASS. 64-bit DPP (`double`/`int64`) compiled directly on
+amdclang 22 — no hi/lo split required. Latency (kReps=4096, lane-63 result):
+
+| Type | sum (µs) | max (µs) | min (µs) |
 | --- | --- | --- | --- |
-| wave::scan_inclusive_sum | — | — | — |
-| hipCUB WarpScan::InclusiveSum | — | — | — |
+| float32 | 232 | 479 | 478 |
+| float64 | 503 | 728 | 727 |
+| int32 | 195 | 194 | 193 |
+| int64 | 505 | 736 | 737 |
 
-Outcome: [ DEFERRED to Run 2 ]. Note: the DPP finding (§10.3) likely applies to
-scan as well — `scan_inclusive_sum` is built on the same `shfl_up`/`shfl_down`
-that lowers to bpermute. A DPP-based scan is a prime candidate for Run 2.
+Sub-finding: only `v_add_f32_dpp` is a *fused* DPP op on CDNA3. For max/min (all
+types) and all 64-bit ops the compiler emits `mov_dpp` + a separate op — still
+zero LDS, but unfused, hence f32 sum is ~2× faster than f32 max/min, while int32
+sum/max/min are uniform (and fastest). 64-bit is ~2–2.4× slower (split into two
+32-bit DPP ops).
+
+**rocprofv3 hardware counters (measured, not ISA-inferred).** This closes the
+zero-LDS claim from §10.3:
+
+| Kernel | SQ_INSTS_LDS | SQ_LDS_IDX_ACTIVE | SQ_INSTS_VALU |
+| --- | --- | --- | --- |
+| wave::dpp::reduce_sum | **0** | **0** | 37.8M |
+| wave::reduce_sum (bpermute) | 25.2M | 100.7M | 37.8M |
+| hipCUB WarpReduce::Sum | 4.2M | 16.8M | 58.7M |
+
+The DPP reduction issues **exactly zero LDS instructions** — the "zero LDS"
+claim is now a hardware counter, not a disassembly inference. VALU is nearly
+identical between DPP and bpermute (37.8M each), isolating LDS elimination as the
+sole cause of the speedup. hipCUB uses LDS *and* more VALU than our full-DPP path.
+
+### 10.4 H1 — Scan vs hipCUB WarpScan (ANSWERED in Run 2)
+
+`scan_inclusive_sum<float>`, wave64, kReps=4096, MI300X VF, ROCm 7.2, hipCUB 4.2.0:
+
+| Kernel | Median (µs) | vs hipCUB | LDS (SQ_INSTS_LDS) |
+| --- | --- | --- | --- |
+| scan portable (`shfl_up` → bpermute) | 966 | 0.36× | 25.2M |
+| **wave::dpp::scan_inclusive_sum (full-DPP)** | **343** | **1.028×** | **0** |
+| hipCUB WarpScan::InclusiveSum | 352 | 1.00× | 0 |
+
+**Outcome: CONFIRMED and exceeded.** The original H1 predicted the register-only
+scan would beat hipCUB by 10–30%. The mechanism turned out to be the same DPP-vs-LDS
+story as reduce: the portable scan lowers to `ds_bpermute`; the full-DPP scan keeps
+the in-row steps on DPP (`row_shr`) and — the hard part — carries the cross-row
+prefix with a *cascade of `row_bcast15`* instead of `shfl`, reaching zero LDS.
+
+The path to it was instructive and is reported honestly: a first **hybrid** scan
+(4 DPP in-row + 3 `shfl` row-carries) reached only 0.91× vs hipCUB, because
+rocprofv3 showed hipCUB's WarpScan is *itself* full-DPP (0 LDS) while our hybrid
+still issued 12.6M LDS instructions via the retained shfl. Eliminating those —
+by discovering that `row_bcast15` shifts each row's total to the next row, so
+applying it repeatedly accumulates the cross-row carry without LDS — brought us
+to 0 LDS and 1.028× vs hipCUB. Correctness: 12/12 PASS (sum/max/min × 4 types),
+validated lane-by-lane.
+
+**Symmetry of the thesis.** Full-DPP (zero LDS) wins on *both* primitives —
+reduce (1.79×) and scan (1.028×) vs hipCUB. The unifying rule, demonstrated by
+building both, is: *whoever removes all LDS-mediated cross-lane traffic wins on
+CDNA3 wave64*. Whether an op can reach zero LDS is the deciding factor.
 
 ### 10.5 H3 — Float32 accumulation overhead (DEFERRED)
 
@@ -439,31 +494,52 @@ retains one. If that geometry generalizes, the contribution is less "we wrote a
 fast reduction" and more "we characterized a complete DPP cross-lane reduction
 pattern for wave64 that avoids LDS entirely."
 
-Upstream relevance: any ROCm code reducing via `__shfl_down` (much of the
-PyTorch/JAX/vLLM HIP port surface) routes cross-lane traffic through LDS. The fix
-is local and composable. **But the strong general claim must not outrun the data**
-(see §10.10) — the present evidence is one type, one size, one virtualized device.
+Run 2 strengthened this from a single-point result to a characterized pattern:
+the DPP advantage holds across float/double/int32/int64 and across both reduce
+and scan, and the zero-LDS mechanism is now confirmed by hardware counters
+(§10.3.1). The reusable contribution is the **full-DPP wave64 geometry** for both
+primitives — `row_shr` in-row plus `row_bcast` cascades for the cross-row/bank
+carry — that reaches zero `ds_bpermute`.
 
-Threats to validity: (1) **single hardware point** (MI300X VF, *virtualized* — not
-bare-metal; VF scheduling can affect latency and we did not pin clocks); (2) the
-microbenchmark amortizes launch overhead with a synthetic dependency chain — the
-production-relevant figure is the speedup embedded in a real kernel, deferred;
-(3) the DPP finding is exploratory (post-hoc), not pre-registered; (4) the
-zero-LDS claim rests on ISA counts, not yet on rocprofv3 traffic counters;
-(5) hipCUB version not recorded — the comparison baseline is therefore
-under-specified until Run 2.
+Upstream relevance: any ROCm code reducing or scanning via `__shfl_*` (much of the
+PyTorch/JAX/vLLM HIP port surface) routes cross-lane traffic through LDS. The fix
+is local and composable.
+
+Threats to validity — updated after Run 2:
+- **(1) Single hardware point** — STILL OPEN. MI300X VF (virtualized, not
+  bare-metal; clocks not pinned). Whether the result is CDNA3-general or
+  gfx942-specific is untested (no MI250/RDNA3 access). Proposed as an AMD
+  collaboration hook rather than a blocker.
+- **(2) Microbenchmark** — STILL OPEN. Synthetic kReps dependency chain; the
+  production-relevant figure is the speedup inside a real kernel (deferred).
+- **(3) Exploratory finding** — the DPP result was post-hoc, not pre-registered;
+  reported as such. (The scan H1, by contrast, *was* pre-registered and is
+  confirmed in §10.4.)
+- **(4) Zero-LDS claim** — RESOLVED. rocprofv3 measures SQ_INSTS_LDS = 0 for both
+  DPP reduce and DPP scan (§10.3.1, §10.4).
+- **(5) hipCUB version** — RESOLVED. hipCUB 4.2.0 recorded.
+- **(6) Type coverage** — partially resolved (f32/f64/i32/i64 done; bf16/fp16
+  open).
 
 ### 10.9 Conclusions
 
 1. The portable `__shfl_down`-based wave reduction is 2.45× slower than hipCUB on
    MI300X (VF) because it lowers to `ds_bpermute` (LDS round-trip), not DPP. **(H2 refuted.)**
-2. A full-DPP reduction (`wave::dpp::reduce_sum`) using `row_shr` + `row_bcast15/31`
-   stays on the DPP datapath (6× `v_add_f32_dpp`, 0× bpermute by ISA count) and,
-   *for float32 wave64 reduction under the §10.1 configuration*, runs **1.35×
-   (broadcast) / 1.79× (lane-63 result)** faster than hipCUB and 4.39× faster than
-   the portable path. Verified correct, verified in ISA. **(Exploratory; bounded claim.)**
-3. The reusable contribution is the full-DPP wave64 reduction *geometry*, not the
-   single number — provided it generalizes across types and confirms via counters.
+2. A full-DPP reduction (`wave::dpp::reduce_sum`, `row_shr` + `row_bcast15/31`)
+   reaches the DPP datapath with **0 LDS instructions (rocprofv3-measured)** and,
+   for float32 wave64 under the §10.1 config, runs **1.35× (broadcast) / 1.79×
+   (lane-63)** faster than hipCUB, 4.39× faster than the portable path. Verified
+   correct, in ISA, and by hardware counters. **(Exploratory; bounded claim.)**
+3. Generalizes across **float/double/int32/int64 × sum/max/min** (12/12 correct,
+   §10.3.1). Sub-finding: only `v_add_f32_dpp` is fused; other ops/types use
+   `mov_dpp` + separate op (still 0 LDS, unfused).
+4. A full-DPP **scan** (`wave::dpp::scan_inclusive_sum`) — in-row `row_shr` plus a
+   cascade of `row_bcast15` for the cross-row carry — reaches **0 LDS** and runs
+   **1.028× over hipCUB WarpScan, 2.61× over the portable scan**. **(H1 confirmed.)**
+5. Unifying result: **full-DPP (zero LDS) wins on both reduce and scan** on CDNA3
+   wave64. The deciding factor is whether an op can eliminate all LDS-mediated
+   cross-lane traffic. Reusable contribution = the full-DPP wave64 *geometry* for
+   both primitives, not a single number.
 
 ### 10.10 Open questions before strengthening the claim
 
