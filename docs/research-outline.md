@@ -338,12 +338,41 @@ DPP control codes were verified empirically lane-by-lane (`probe_dpp*.hip`).
 | hipCUB WarpReduce::Sum | 376.7 | 389.5 | 712.5 | 1.00× |
 
 ISA of `wave::dpp` (no broadcast): **6× `v_add_f32_dpp`, 0× `ds_bpermute`** —
-100% DPP datapath, zero LDS traffic. hipCUB still emits 1 `ds_bpermute` for the
-bank cross; we avoid it with `row_bcast31`.
+100% DPP datapath. The portable path's 6× `ds_bpermute` indicates LDS-mediated
+cross-lane traffic; hipCUB still emits 1 `ds_bpermute` for the bank cross, which
+the `row_bcast31` step avoids. (Note: the zero-LDS claim is supported by ISA
+instruction counts; direct confirmation via rocprofv3 LDS-traffic counters is
+deferred to Run 2 — see §10.10.)
 
-**Result: the full-DPP reduction beats hipCUB by 1.35× (broadcast, fair
-apples-to-apples) to 1.79× (result left on lane 63), and beats the portable
-shuffle path by 4.39×.** Correctness verified: sum of 0..63 = 2016 on lane 63.
+**Result (stated as a bounded experimental claim, not a general one).**
+Under the exact configuration in §10.1 — `reduce_sum<float>`, wave64, 1024
+blocks × 64 threads, kReps=4096 amortized, MI300X VF, ROCm 7.2 — the full-DPP
+reduction is **1.79× faster than hipCUB `WarpReduce::Sum`** (210 vs 377 µs) when
+the result is left on lane 63, **1.35× faster** (279 µs) when broadcast to all
+lanes, and **4.39× faster** than the portable `__shfl_down` path. Correctness
+verified: sum of 0..63 = 2016 on lane 63.
+
+> **Framing discipline.** The defensible claim is the *bounded* one above — a
+> specific reduction pattern, type, size, and (virtualized) device. It is **not**
+> "we beat hipCUB" in general. The result is expected to be sensitive to: hipCUB
+> version, compile flags, element type, reduction width, and physical-vs-VF
+> hardware. Each of those is a question a reviewer will (correctly) ask; §10.10
+> lists which are still open.
+
+**Exact benchmark coordinates (for reproducibility / reviewer questions):**
+
+| Parameter | Value | Status |
+| --- | --- | --- |
+| Operation | `reduce_sum`, float32 | fixed |
+| Reduction width | wave64 (64 lanes) | fixed |
+| Launch | 1024 blocks × 64 threads, kReps=4096 internal | fixed |
+| Timing | 100 warmup + 1000 iters, hipEvent median/P99 | fixed |
+| GPU | MI300X **VF** (virtualized, gfx942) — not bare-metal | **caveat** |
+| ROCm / HIP | 7.2.0 / 7.2.26015, amdclang 22 | fixed |
+| Compile flags | `-O3 --offload-arch=gfx942 -std=c++17` | fixed |
+| **hipCUB version** | **not recorded in Run 1 — CAPTURE in Run 2** | **gap** |
+| Clock pinning | not applied (GPU started in low-power, clock 2100 MHz observed) | **caveat** |
+| Other types (f64/i32/i64/bf16/fp16) | not yet measured | open |
 
 ### 10.4 H1 — Scan vs hipCUB WarpScan (DEFERRED)
 
@@ -392,32 +421,72 @@ framing assumed `ds_swizzle`; the actual lowering is `ds_bpermute` (portable) /
 
 ### 10.8 Discussion
 
-The headline result inverts the project's working thesis. We set out to show a
-header-only wave-primitive library could *match* hipCUB. Run 1 first showed the
-naive portable path losing badly (2.45×), then traced the cause to a concrete,
-fixable ISA defect: the generic HIP `__shfl_down` does not use CDNA3's DPP
-datapath and pays an LDS round-trip on every reduction step. Implementing the
-reduction directly on DPP — including `row_bcast` for the boundary crosses that
-even hipCUB handles with a residual `ds_bpermute` — produces a header-only
-primitive that *outperforms* hipCUB by 1.35–1.79×.
+The most valuable part of this run is not the speedup number — it is the
+**architectural causal chain**, which is unusually clean for a performance result:
 
-This is a portability-and-performance finding with direct upstream relevance:
-any ROCm code that reduces via `__shfl_down` (much of the PyTorch/JAX/vLLM HIP
-port surface) leaves this speedup on the table. The fix is local and composable.
+```text
+__shfl_down  →  ds_bpermute  →  LDS-mediated cross-lane traffic  →  added latency
+   vs
+DPP          →  cross-lane VALU datapath  →  no LDS-mediated traffic  →  lower latency
+```
 
-Threats to validity: (1) single hardware point (MI300X VF, virtualized); (2)
-the microbenchmark amortizes launch overhead with a synthetic dependency chain —
-the production-relevant figure is the speedup embedded in a real kernel, deferred
-to future work; (3) the DPP finding is exploratory (post-hoc), not pre-registered,
-and is reported as such.
+Most kernel-optimization results report "mine is faster" without isolating *why*.
+Here the ISA instruction counts tie the latency directly to a specific datapath
+choice. The secondary, broader-reach finding is the **full-DPP wave64 geometry**
+itself: `row_shr` (in-row) + `row_bcast15`/`row_bcast31` (row- and bank-boundary
+crosses) completes a 64-lane reduction with zero `ds_bpermute` — even hipCUB
+retains one. If that geometry generalizes, the contribution is less "we wrote a
+fast reduction" and more "we characterized a complete DPP cross-lane reduction
+pattern for wave64 that avoids LDS entirely."
+
+Upstream relevance: any ROCm code reducing via `__shfl_down` (much of the
+PyTorch/JAX/vLLM HIP port surface) routes cross-lane traffic through LDS. The fix
+is local and composable. **But the strong general claim must not outrun the data**
+(see §10.10) — the present evidence is one type, one size, one virtualized device.
+
+Threats to validity: (1) **single hardware point** (MI300X VF, *virtualized* — not
+bare-metal; VF scheduling can affect latency and we did not pin clocks); (2) the
+microbenchmark amortizes launch overhead with a synthetic dependency chain — the
+production-relevant figure is the speedup embedded in a real kernel, deferred;
+(3) the DPP finding is exploratory (post-hoc), not pre-registered; (4) the
+zero-LDS claim rests on ISA counts, not yet on rocprofv3 traffic counters;
+(5) hipCUB version not recorded — the comparison baseline is therefore
+under-specified until Run 2.
 
 ### 10.9 Conclusions
 
 1. The portable `__shfl_down`-based wave reduction is 2.45× slower than hipCUB on
-   MI300X because it lowers to `ds_bpermute` (LDS round-trip), not DPP. **(H2 refuted.)**
+   MI300X (VF) because it lowers to `ds_bpermute` (LDS round-trip), not DPP. **(H2 refuted.)**
 2. A full-DPP reduction (`wave::dpp::reduce_sum`) using `row_shr` + `row_bcast15/31`
-   stays entirely on the DPP datapath (6× `v_add_f32_dpp`, 0× bpermute) and beats
-   hipCUB by **1.35× (broadcast) / 1.79× (lane-63 result)**, and the portable path
-   by **4.39×**. Verified correct, verified in ISA. **(Exploratory.)**
-3. Next run: extend DPP to `reduce_max`/`min`, `double`/`int32`/`int64`, build a
-   DPP-based `scan`, and complete the deferred H1/H3/H4 tables.
+   stays on the DPP datapath (6× `v_add_f32_dpp`, 0× bpermute by ISA count) and,
+   *for float32 wave64 reduction under the §10.1 configuration*, runs **1.35×
+   (broadcast) / 1.79× (lane-63 result)** faster than hipCUB and 4.39× faster than
+   the portable path. Verified correct, verified in ISA. **(Exploratory; bounded claim.)**
+3. The reusable contribution is the full-DPP wave64 reduction *geometry*, not the
+   single number — provided it generalizes across types and confirms via counters.
+
+### 10.10 Open questions before strengthening the claim
+
+Ordered by how much each tightens the result (informed by external review):
+
+1. **Other types** — does the DPP pattern hold for `double`, `int32`, `int64`,
+   `bf16`, `fp16`? (Code ready: `bench_reduce_dpp_types.hip`. 64-bit via DPP is
+   the main compile-time risk; fallback documented.) Holding across types is the
+   single biggest credibility gain.
+2. **rocprofv3 counters** — measure LDS traffic, VALU utilization, SALU stalls,
+   VGPR pressure. Goal: show measured LDS traffic ≈ 0 for the DPP kernel, turning
+   the zero-LDS claim from "inferred by ISA" into "measured".
+3. **hipCUB version + flags** — record exactly, so the baseline is specified.
+4. **CDNA3 vs gfx942 vs wave32** — is this a CDNA3 property or specific to gfx942?
+   Re-run on MI250 (CDNA2, gfx90a, wave64) and an RDNA3 part (wave32, where the
+   16-lane row geometry differs). **This requires hardware we do not currently
+   have access to** (the credit grant is MI300X-only). Rather than block on it,
+   we treat multi-hardware validation as a *collaboration hook*: a concrete,
+   already-substantiated result to offer AMD in exchange for MI250/MI325/RDNA3
+   access. The single-device caveat is declared, not hidden.
+5. **Scan** — `inclusive_scan` / `exclusive_scan` are more complex and more used
+   in real kernels; the same `shfl`→`bpermute` lowering applies, so a DPP scan is
+   the natural next primitive after reduction is consolidated across types.
+
+Until (1) and (2) are done, the result is reported as a **bounded experimental
+finding**, not a general performance claim.

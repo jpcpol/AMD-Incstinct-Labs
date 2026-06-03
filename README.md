@@ -36,7 +36,7 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 | Area | Status | What it solves |
 | --- | --- | --- |
-| [wave-primitives](research/wave-primitives/) | **Validated on MI300X** | Header-only library: correct `reduce`, `scan`, `ballot`, `shuffle` for both wave32 (RDNA/NVIDIA) and wave64 (CDNA). DPP-based reduction **beats hipCUB by 1.35–1.79×** — see Key Result below. |
+| [wave-primitives](research/wave-primitives/) | **First result on MI300X** | Header-only library: correct `reduce`, `scan`, `ballot`, `shuffle` for both wave32 (RDNA/NVIDIA) and wave64 (CDNA). DPP-based float32 reduction measured **1.35–1.79× faster than hipCUB** in one configuration — bounded result, see Key Result below. |
 | [flash-attention-mi300x](research/flash-attention-mi300x/) | In progress | Flash Attention using DME async prefetch to overlap HBM loads with MFMA compute; FA3-style pipelining for AMD |
 | [infinity-fabric-allreduce](research/infinity-fabric-allreduce/) | Planned | Topology-aware AllReduce that uses all 7 Infinity Fabric links simultaneously instead of serializing through a ring |
 | [dme-abstraction](research/dme-abstraction/) | Planned | C++ API over the CDNA3 Data Movement Engine — the only CDNA3 feature with no NVIDIA equivalent and no usable interface |
@@ -44,24 +44,33 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 ---
 
-## Key Result (MI300X, ROCm 7.2, 2026-06-03)
+## Key Result (MI300X VF, ROCm 7.2, 2026-06-03 — bounded experimental claim)
 
-A header-only wave reduction can **outperform hipCUB** by using the CDNA3 DPP
-datapath directly instead of the generic `__shfl_down` lowering.
+For a **float32 wave64 reduction** under one specific configuration, a header-only
+reduction on the CDNA3 DPP datapath measured faster than hipCUB `WarpReduce::Sum`:
 
 | Reduction (`reduce_sum<float>`, wave64) | Median latency | vs hipCUB |
 | --- | --- | --- |
-| `wave::reduce_sum` — portable `__shfl_down` (lowers to 6× `ds_bpermute`, LDS) | 922 µs | 0.41× |
+| `wave::reduce_sum` — portable `__shfl_down` (6× `ds_bpermute`, LDS) | 922 µs | 0.41× |
 | **`wave::dpp::reduce_sum` — full DPP (6× `v_add_f32_dpp`, 0× bpermute)** | **210–279 µs** | **1.35–1.79×** |
 | hipCUB `WarpReduce::Sum` | 377 µs | 1.00× |
 
-**Why:** the generic HIP `__shfl_down` round-trips every reduction step through
-Local Data Share (`ds_bpermute`). The DPP path keeps the entire 6-step wave64
-reduction on the cross-lane VALU datapath — including the row- and bank-boundary
-crosses via `row_bcast15`/`row_bcast31`, which even hipCUB handles with a residual
-`ds_bpermute`. Verified by ISA inspection and lane-by-lane correctness on real
-MI300X hardware. Any ROCm code reducing via `__shfl_down` (much of the
-PyTorch/JAX/vLLM HIP surface) leaves this speedup unclaimed.
+**Why (the part that generalizes):** the generic HIP `__shfl_down` routes every
+reduction step through Local Data Share (`ds_bpermute`). The DPP path keeps the
+6-step wave64 reduction on the cross-lane VALU datapath — including the row- and
+bank-boundary crosses via `row_bcast15`/`row_bcast31`, which even hipCUB handles
+with a residual `ds_bpermute`. The architectural causal chain (`__shfl_down →
+ds_bpermute → LDS traffic → latency`) is verified by ISA instruction counts and
+lane-by-lane correctness.
+
+**What this is and isn't.** This is a *bounded* result: one operation, one type,
+one size, on a **virtualized** MI300X, with the hipCUB version not yet recorded.
+It is **not** a general "we beat hipCUB" claim. Open items before strengthening it
+— other types, rocprofv3 LDS-traffic counters, and CDNA3-vs-gfx942 hardware
+generality — are tracked in [`docs/research-outline.md` §10.10](docs/research-outline.md).
+That said, any ROCm code reducing via `__shfl_down` (much of the PyTorch/JAX/vLLM
+HIP surface) routes cross-lane traffic through LDS, so the direction of the
+finding has broad reach.
 
 Full data, methodology, and the (refuted) pre-registered hypothesis that led here:
 [`docs/research-outline.md` §10](docs/research-outline.md).
