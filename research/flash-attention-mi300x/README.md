@@ -18,7 +18,7 @@ Each step is separately benchmarked and validated before proceeding.
 | Step | File | Status | What it adds |
 | ---- | ---- | ------ | ------------ |
 | 1 | `kernels/fa_naive.hip` | written | FA2 baseline: portable reductions, sync loads |
-| 2 | `kernels/fa_dpp.hip` | planned | Swap rowmax/rowsum to `wave::dpp::*` — measures LDS-pressure relaxation on tile size |
+| 2 | `kernels/fa_dpp.hip` | written | DPP rowmax/rowsum + two-phase reduction for Bc=64/128/256 |
 | 3 | `kernels/fa_dme.hip` | planned | Double-buffer K/V via DME async — requires dme-abstraction validation first |
 | 4 | `kernels/fa_mfma.hip` | planned | MFMA intrinsics + tile-size tuning (ties into mlir-mfma-tiling) |
 
