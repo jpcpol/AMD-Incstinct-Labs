@@ -35,34 +35,54 @@ auto token = dme::async_prefetch(...);
 dme::wait(token);  // ensure load complete before reading LDS
 ```
 
-## Implementation Path
+## Implementation Path — incremental (de-risked)
 
-1. Thin wrapper around `amdgpu.tensor_load_to_lds` via HIP inline assembly / LLVM intrinsics
-2. Layout computation helper: converts multi-dimensional indexing to byte offsets
-3. Async token interface using `rocdl.asyncmark` / `rocdl.wait.asyncmark`
+We build bottom-up: get the *simplest* DME copy working and verified on real
+hardware first, then layer the tensor API on top. This avoids designing the 4D
+tensor descriptor before we even know the 1D builtin's exact semantics.
 
-## Files
+1. **1D element / tile copy** (`dme_copy.hpp`) — direct wrapper over
+   `__builtin_amdgcn_global_load_lds`. ← *current step*
+2. Empirical probe of the intrinsic's offset + wait semantics (`probe_dme.hip`).
+3. Bandwidth benchmark: DME copy vs raw buffer load vs `hipMemcpyAsync`.
+4. Async token interface (overlap DME load with MFMA compute).
+5. Multi-dimensional tensor API (the `tensor_prefetch` vision above).
+6. Integration with `flash-attention-mi300x`.
 
+## The underlying intrinsic (ROCm 7.x, gfx942)
+
+```cpp
+void __builtin_amdgcn_global_load_lds(
+    void* global_ptr,  // per-lane HBM source  (addrspace 1 or 7)
+    void* lds_ptr,     // uniform LDS dest      (addrspace 3)
+    int   size,        // bytes: 1/2/4/8 (immediate)
+    int   offset,      // immediate byte offset — applied to BOTH ptrs (to verify)
+    int   aux);        // cache policy (sc0 = streaming, recommended on gfx942)
 ```
-include/
-    dme/tensor_prefetch.hpp    # Main API
-    dme/layout.hpp             # Layout descriptors and stride helpers
-    dme/async_token.hpp        # Async completion tokens
-src/
-    dme_intrinsics.hip         # Thin wrappers over LLVM intrinsics
-tests/
-    test_basic_load.hip        # Correctness: DME load matches memcpy
-    test_async_overlap.hip     # Verify compute+load overlap via rocprof
-benchmarks/
-    bench_bandwidth.hip        # DME bandwidth vs direct buffer load
-```
+
+## Files (current)
+
+| File | Purpose |
+| --- | --- |
+| `include/dme/dme_copy.hpp` | C++ API: `copy_element`, `copy_element_stream`, `copy_tile_1d`, `wait` |
+| `tests/probe_dme.hip` | Empirical probe of the builtin's offset + wait semantics |
+
+## Open questions for Run 4 (probe answers these)
+
+1. **Offset semantics** — does `offset` apply to global ptr, LDS ptr, or both?
+2. **Wait encoding** — is `__builtin_amdgcn_s_waitcnt(0)` correct, or is a
+   specific `lgkmcnt`/`vmcnt` encoding needed? (Wrong → corrupted data in probe.)
+3. **rocprofv3** — does the copy route through the DME (off the VMEM path)?
 
 ## Status
 
-- [ ] Research: verify exact intrinsic names in ROCm 6.2 (`__builtin_amdgcn_global_load_lds` availability)
-- [ ] Basic sync API prototype
-- [ ] Async token interface
+- [x] Research: confirm `__builtin_amdgcn_global_load_lds` signature (ROCm 7.x)
+- [x] 1D sync API prototype (`dme_copy.hpp`) — written, **unvalidated**
+- [x] Hardware probe written (`probe_dme.hip`)
+- [ ] Hardware validation (Run 4 — blocked on GPU availability)
 - [ ] Bandwidth benchmark: DME vs raw buffer load vs `hipMemcpyAsync`
+- [ ] Async token interface
+- [ ] Multi-dimensional tensor API
 - [ ] Integration with `flash-attention-mi300x`
 
 ## Gap Reference
