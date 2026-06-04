@@ -1,64 +1,68 @@
 # flash-attention-mi300x
 
-Flash Attention for AMD MI300X using DME async prefetch and FA3-style compute/memory pipelining.
+Flash Attention for AMD MI300X — incremental build exploiting DPP zero-LDS reductions
+and DME async prefetch for FA3-style compute/memory pipelining on CDNA3.
 
 ## Problem
 
-MI300X has 5.3 TB/s HBM3 bandwidth — 58% more than H100's 3.35 TB/s. Yet no Flash Attention implementation exploits this:
+MI300X has 5.3 TB/s HBM3 bandwidth — 58% more than H100's 3.35 TB/s. The gap in
+Flash Attention is not just bandwidth: the key insight from this project is that
+**DPP reductions use zero LDS**, which relaxes the LDS pressure that limits FA tile
+size. All current backends use ds_bpermute (LDS roundtrip) for row-softmax, which
+steals LDS budget from K/V tiles.
 
-- The Data Movement Engine (DME) can async-load HBM→LDS without occupying CUs, but all current backends ignore it
-- FA3-style pipelining (overlap compute with memory) is not implemented for AMD
-- The best current option (FA2 Triton FP8) crashes the compiler when autotune is also enabled
+## Build order (four independent steps)
 
-## Approach
+Each step is separately benchmarked and validated before proceeding.
 
-### Stage 1: Fix the autotune + FP8 compiler bug
+| Step | File | Status | What it adds |
+| ---- | ---- | ------ | ------------ |
+| 1 | `kernels/fa_naive.hip` | written | FA2 baseline: portable reductions, sync loads |
+| 2 | `kernels/fa_dpp.hip` | planned | Swap rowmax/rowsum to `wave::dpp::*` — measures LDS-pressure relaxation on tile size |
+| 3 | `kernels/fa_dme.hip` | planned | Double-buffer K/V via DME async — requires dme-abstraction validation first |
+| 4 | `kernels/fa_mfma.hip` | planned | MFMA intrinsics + tile-size tuning (ties into mlir-mfma-tiling) |
 
-The bug: enabling `TRITON_FA_AUTOTUNE=1` with FP8 dtype causes `hipcc` internal error. Fix upstream in triton-lang ROCm backend.
+## Step 1: fa_naive (baseline)
 
-### Stage 2: DME-pipelined attention
+**File:** `kernels/fa_naive.hip`  
+**Run:** `bash scripts/run_fa_naive.sh` (from `amd-instinct-labs/` root)
 
-Use `amdgpu.global_load_async_to_lds` (MLIR) / `__builtin_amdgcn_global_load_lds` to issue async HBM→LDS loads for Q, K, V tiles while MFMA units process the previous tile.
+Layout:
+- One wave (64 threads) per query row
+- `kBc=64`: K/V tile fits in one wave64 reduction exactly
+- `kBr=1`: one query row per wave (simplest correct layout)
+- Portable wave reductions (`__shfl_down` → ds_bpermute on CDNA3)
+- Synchronous K/V loads from HBM (no DME)
+
+Output:
+
+- Correctness vs CPU reference (expected: max_rel_err < 1e-3)
+- Median/P99 latency, TFLOPS achieved, HBM bandwidth
+- rocprofv3 `SQ_INSTS_LDS` baseline (step 2 will reduce this to ~0 for reductions)
+
+## The key argument (why DPP matters for FA, not just microbenchmarks)
 
 ```
-Cycle N:    MFMA(Q[i] × K[i])     +    DME_load(Q[i+1], K[i+1])
-Cycle N+1:  MFMA(Q[i+1] × K[i+1]) +   DME_load(V[i+1])
-Cycle N+2:  MFMA(scores × V[i])   +    DME_load(next block)
+LDS budget per CU = 64 KB
+Tile storage: K_j (Bc×d) + V_j (Bc×d) + Q (Br×d)
+
+With ds_bpermute reductions:
+  LDS = tiles + reduction scratch → tiles must shrink
+  → smaller Bc → more iterations → worse MFMA utilization
+
+With DPP reductions (zero LDS):
+  LDS = tiles only → maximum tile size
+  → larger Bc → fewer iterations → better MFMA utilization
 ```
 
-### Stage 3: FA3-style warp specialization
+This is the argument that connects the Run 2 wave-primitives result to FA.
+Step 2 measures this directly: fix the kernel, vary Bc, compare DPP vs portable.
 
-Split warps into producer (load) and consumer (MFMA) groups, using LDS as a ping-pong buffer. The DME handles HBM→LDS, consumer warps never stall on memory.
+## Dependencies
 
-## Benchmarks
-
-Target: exceed FA2 Triton on MI300X by exploiting the HBM bandwidth advantage.
-
-| Backend | BW utilization | TFLOPS | VRAM savings |
-| --- | --- | --- | --- |
-| PyTorch SDPA (baseline) | ~30% HBM | — | 0% |
-| FA2 Triton FP8 (current best) | ~55% HBM | — | ~24% |
-| DME-pipelined (this work) | target: >80% HBM | TBD | TBD |
-
-## Files
-
-```
-include/
-    flash_attention_dme.hpp    # C++ interface
-src/
-    fa_dme_kernel.hip          # HIP kernel with DME intrinsics
-    fa_triton_fix.py           # Triton autotune+FP8 patch
-benchmarks/
-    bench_fa.py                # Comparison vs FA2 Triton / PyTorch SDPA
-```
-
-## Status
-
-- [ ] Reproduce autotune+FP8 crash, isolate minimal repro
-- [ ] DME async load prototype for single attention block
-- [ ] Full pipelined attention kernel
-- [ ] Benchmarks vs FA2 Triton on NanoGPT workload
-- [ ] Upstream: fix to triton-lang ROCm backend
+- `../../wave-primitives/include/wave_primitives/wave_reduce_dpp.hpp` — validated Run 2
+- `../../dme-abstraction/include/dme/dme_copy.hpp` — step 3 only, needs Run 4 validation
+- MFMA via `__builtin_amdgcn_mfma_*` — step 4 only
 
 ## Gap Reference
 
