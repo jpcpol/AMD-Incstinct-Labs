@@ -36,7 +36,7 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 | Area | Status | What it solves |
 | --- | --- | --- |
-| [wave-primitives](research/wave-primitives/) | **First result on MI300X** | Header-only library: correct `reduce`, `scan`, `ballot`, `shuffle` for both wave32 (RDNA/NVIDIA) and wave64 (CDNA). DPP-based float32 reduction measured **1.35–1.79× faster than hipCUB** in one configuration — bounded result, see Key Result below. |
+| [wave-primitives](research/wave-primitives/) | **First result on MI300X** | Header-only `reduce`/`scan`/`ballot`/`shuffle`, correct for wave32 and wave64. Key finding: a **full-DPP geometry eliminates LDS-mediated cross-lane traffic** (rocprofv3-measured 0 LDS) — reduction 1.35–1.79× over hipCUB, scan at parity. Bounded result, see Key Result below. |
 | [flash-attention-mi300x](research/flash-attention-mi300x/) | In progress | Flash Attention using DME async prefetch to overlap HBM loads with MFMA compute; FA3-style pipelining for AMD |
 | [infinity-fabric-allreduce](research/infinity-fabric-allreduce/) | Planned | Topology-aware AllReduce that uses all 7 Infinity Fabric links simultaneously instead of serializing through a ring |
 | [dme-abstraction](research/dme-abstraction/) | Planned | C++ API over the CDNA3 Data Movement Engine — the only CDNA3 feature with no NVIDIA equivalent and no usable interface |
@@ -46,9 +46,12 @@ These are not speculative gaps. Each one is verified against AMD's own documenta
 
 ## Key Result (MI300X VF, ROCm 7.2, 2026-06-03 — bounded experimental claim)
 
-For **wave64 reduction and scan** under a specific configuration, header-only
-primitives on the CDNA3 DPP datapath measured faster than hipCUB — with **zero
-LDS traffic confirmed by rocprofv3**:
+The strong finding is **not** wave-size portability — it is that the CDNA3 DPP
+datapath can replace LDS-mediated cross-lane communication *entirely*. For wave64
+reduction and scan, header-only DPP primitives reach **zero LDS traffic
+(rocprofv3-measured)**: reduction is clearly faster than hipCUB; scan reaches
+parity / a slight edge. The same pattern in two independent algorithms is what
+makes this look architectural, not algorithm-specific.
 
 | Primitive (`<float>`, wave64) | DPP median | vs hipCUB | LDS (measured) |
 | --- | --- | --- | --- |
@@ -66,13 +69,17 @@ cross-row/bank via `row_bcast` cascades — reaching **zero `ds_bpermute`**.
 rocprofv3 measures `SQ_INSTS_LDS = 0` for both DPP primitives vs 25.2M for the
 portable path, with near-identical VALU — isolating LDS elimination as the cause.
 The unifying rule: *whoever removes all LDS-mediated cross-lane traffic wins on
-CDNA3 wave64* — true for reduce (we beat hipCUB) and scan (we edge it).
+CDNA3 wave64*. For reduction the margin is large (1.35–1.79×); for scan it is
+narrow (~3%, i.e. **comparable to or slightly above** an already well-optimized
+hipCUB WarpScan that is itself full-DPP). The value of the scan result is the
+*repetition* of the pattern, not its margin.
 
 **What this is and isn't.** Still a *bounded* result: a **virtualized** MI300X,
 clocks unpinned, and CDNA3-vs-gfx942 generality untested (no MI250/RDNA3 access).
-It is **not** a blanket "we beat hipCUB" claim. Open items before strengthening it
-— other types, rocprofv3 LDS-traffic counters, and CDNA3-vs-gfx942 hardware
-generality — are tracked in [`docs/research-outline.md` §10.10](docs/research-outline.md).
+It is **not** a blanket "we beat hipCUB" claim, and the scan margin specifically
+is small. Biggest open gap: **no real-kernel demonstration yet** (the speedup is
+shown for the primitives in isolation, not inside LayerNorm/Flash Attention).
+Open items are tracked in [`docs/research-outline.md` §10.10](docs/research-outline.md).
 That said, any ROCm code reducing via `__shfl_down` (much of the PyTorch/JAX/vLLM
 HIP surface) routes cross-lane traffic through LDS, so the direction of the
 finding has broad reach.

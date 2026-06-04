@@ -1,12 +1,42 @@
-# Research Outline: Wave-Size-Agnostic Primitives for AMD CDNA3
+# Research Outline: Eliminating LDS-Mediated Cross-Lane Communication on CDNA3 — Full-DPP Wave64 Primitives
 
-> **Status**: §1–§9 pre-registered before any benchmark. §10 holds Run 1 results
-> (2026-06-03, MI300X). Hypotheses H1–H9 below are the original pre-registration,
-> unedited; §10 reports outcomes including one exploratory (non-pre-registered)
-> finding, flagged as such.  
+> *(Working title updated after Run 2. The project began as "wave-size-agnostic
+> primitives"; the experimental results relocated the strong finding from
+> wave-size portability to the elimination of LDS-mediated cross-lane traffic via
+> DPP. §1.0 below records this re-framing.)*
+>
+> **Status**: §1–§9 pre-registered before any benchmark. §10 holds Run 1 + Run 2
+> results (2026-06-03, MI300X). Hypotheses H1–H9 below are the original
+> pre-registration, unedited; §10 reports outcomes including one exploratory
+> (non-pre-registered) finding, flagged as such.  
 > **Target**: arXiv cs.DC + AMD ROCm upstream contribution  
 > **Hardware**: AMD Instinct MI300X (gfx942, ROCm 7.2)  
 > **Repository**: github.com/jpcpol/AMD-Incstinct-Labs
+
+---
+
+## 1.0 Thesis (revised after Run 2)
+
+This project began framed around a **portability** problem: warp-level CUDA
+primitives assume 32 lanes and break on CDNA's 64-lane wavefront (§1, unchanged
+below as the original motivation). The experimental results (§10) pointed to a
+deeper and more novel thesis:
+
+> **On CDNA3, the decisive performance factor is not wave64 itself — it is the
+> ability to replace LDS-mediated cross-lane communication entirely with the DPP
+> (cross-lane VALU) datapath.**
+
+Evidence for the shift: the portable `__shfl`-based primitives lower to
+`ds_bpermute` (an LDS round-trip per step); a full-DPP implementation reaches
+**zero LDS instructions** (rocprofv3-measured) and outperforms hipCUB. Crucially,
+the *same* pattern holds for **two independent algorithms** — reduction (clearly
+faster) and scan (comparable to, slightly above, hipCUB) — which is what makes it
+look like an **architectural property** rather than a single-kernel curiosity.
+
+Wave-size agnosticity remains a *useful* correctness property of the library, but
+it is not the headline. The headline is the LDS-elimination geometry. Sections
+below retain the original portability framing for the historical record; §10 and
+the README carry the revised emphasis.
 
 ---
 
