@@ -173,8 +173,16 @@ __global__ void fa_dpp_kernel(
     int n_heads,
     float scale)
 {
-    // 2 * kWavesPerBlock floats for the two-phase reduction scratch
-    __shared__ float lds_scratch[2 * kWavesPerBlock < 2 ? 2 : 2 * kWavesPerBlock];
+    // LDS layout:
+    //   [0 .. kWavesPerBlock-1]          : wave-max partials (phase 2a)
+    //   [kWavesPerBlock .. 2k-1]          : wave-sum partials (phase 2b)
+    //   [2k .. 2k + kBc - 1]             : p_val staging for P·V (multi-wave only)
+    // For kWavesPerBlock==1: only the first 2 slots are ever written; p staging
+    // is not needed (pure shfl path). The array is sized for the worst case.
+    static constexpr int kLdsScratch = 2 * kWavesPerBlock;
+    static constexpr int kLdsP       = (kWavesPerBlock > 1) ? kBc : 0;
+    __shared__ float lds_scratch[kLdsScratch];           // reduction scratch
+    __shared__ float p_shared   [kLdsP > 0 ? kLdsP : 1]; // P staging (unused for Bc=64)
 
     const int head_batch_id = blockIdx.y;
     const int batch_id = head_batch_id / n_heads;
@@ -277,15 +285,9 @@ __global__ void fa_dpp_kernel(
                     o_acc[c] += p_k * v_row[c * 64 + lane];
             }
         } else {
-            // Multi-wave: stage p_val into LDS, then read back
-            // Reuse lds_scratch (it's done after block_reduce_max_sum's __syncthreads).
-            // We need kBc floats — declare a separate shared array.
-            // Since kBc can be 128/256 and lds_scratch is only 2*kWavesPerBlock,
-            // we use a statically-sized shared array declared here via template trick.
-            // Workaround: use the dynamic-shared approach with a static max size.
-            // Max kBc we support = 256 → 256 floats = 1 KB LDS for P staging.
-            __shared__ float p_shared[kBc <= 256 ? kBc : 256];
-
+            // Multi-wave: stage p_val into p_shared (declared in kernel scope),
+            // then all threads read from it for the P·V accumulation.
+            // One LDS write per thread per tile, vs O(Tc*12) in the naive path.
             p_shared[tid] = p_val;
             __syncthreads();
 
