@@ -1,0 +1,21 @@
+================================================================================
+G2: bf16 fp32-accumulation overhead — MI300X VF (gfx942), ROCm 7.2
+Session 2026-06-05 (second VM session) | kReps=4096 amortized
+================================================================================
+
+Strategy                Median       Throughput
+bf16 (fp32 acc)         1123.0 µs    0.058 Ge/s
+bf16 (naive bf16)       2936.0 µs    0.022 Ge/s
+
+  Overhead: -61.7% (fp32-acc is much FASTER than native bf16).
+
+CONFIRMED, even more strongly than the __half case (H3 was -10.1%).
+On gfx942 the naive-bf16 path round-trips through float on every reduction step
+(no native bf16 add), making it expensive. Promoting bf16 -> float32 once and
+reducing in float is strictly superior: lower latency AND higher accuracy.
+
+This extends H3 (fp32-accumulation is the right default for low-precision wave
+reductions on CDNA3) from __half to bf16. For both half types, the library's
+fp32-accumulation choice is the correct one — not a precision/speed tradeoff but
+a win on both axes.
+================================================================================

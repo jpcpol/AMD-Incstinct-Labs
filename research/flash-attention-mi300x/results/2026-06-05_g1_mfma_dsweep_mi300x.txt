@@ -1,0 +1,22 @@
+================================================================================
+G1: MFMA Flash Attention head-dim sweep — MI300X VF (gfx942), ROCm 7.2
+Session 2026-06-05 (second VM session)
+Config: Br=16 Bc=64 seqLen=512 heads=8, 1 wave/block, MFMA Q·Kᵀ and P·V
+================================================================================
+
+  D=64    max_err=0.00004 [PASS]  median=86.7 µs   6.19 TFLOPS
+  D=128   max_err=0.00005 [PASS]  median=102.7 µs  10.45 TFLOPS
+
+HYPOTHESIS CONFIRMED: larger head dim lets MFMA saturate the matrix cores.
+  D=64 → D=128: TFLOPS 6.19 → 10.45 (+69%). nD = D/16 doubles (4 → 8) so each
+  KV iteration issues more MFMA work, improving core utilization. Latency rises
+  (more total FLOPs) but compute efficiency grows strongly.
+
+This nuances the Step-4 negative result (fa_mfma2, D=64, 0.95× vs dot-product):
+MFMA did not lose because it is MFMA — it lost because D=64 tiles are too small.
+At D=128 the matrix-core path is clearly more efficient. The next question (for a
+future session) is the crossover vs the dot-product path AT D=128, and D=256.
+
+--- Re-confirmation: FA Step 3 (fa_dme), reproducibility check ---
+  Median 82.3 µs | 6.52 TFLOPS | 814.9 GB/s | 1.18× vs naive  (matches prior 82.4 µs)
+================================================================================
