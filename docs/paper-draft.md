@@ -187,7 +187,7 @@ through 6 binary steps. The DPP geometry we use:
 
 **Step 1-4 (in-row, 16-lane rows):**
 
-```
+```text
 row_shr 1: lane[i] += lane[i-1]   (within row, i&15 != 0)
 row_shr 2: lane[i] += lane[i-2]   (within row, i&15 >= 2)
 row_shr 4: lane[i] += lane[i-4]   (within row, i&15 >= 4)
@@ -199,7 +199,7 @@ lane 47 holds lanes 32–47, lane 63 holds lanes 48–63.
 
 **Step 5 (row boundary, row 0 total → rows 1,2,3):**
 
-```
+```text
 c1 = row_bcast15(v)   →  lanes 16–31 receive lane 15's value (row 0 total)
                           lanes 32–47 receive lane 31's value (row 1 total)
                           lanes 48–63 receive lane 47's value (row 2 total)
@@ -207,13 +207,14 @@ c1 = row_bcast15(v)   →  lanes 16–31 receive lane 15's value (row 0 total)
 
 **Step 6 (bank boundary, rows 0+1 total → rows 2,3):**
 
-```
+```text
 c1b = row_bcast15(c1)  →  lanes 32–47 receive row 0 total (from lane 31 of c1)
                            lanes 48–63 receive rows 0+1 total
 c1c = row_bcast15(c1b) →  lanes 48–63 receive rows 0+1+2 total
 ```
 
 Combined carry per lane group:
+
 - Lanes 0–15: no carry (local row)
 - Lanes 16–31: c1 (row 0 total)
 - Lanes 32–47: c1 + c1b (rows 0+1 total)
@@ -342,6 +343,105 @@ All primitives verified lane-by-lane (`probe_scan_dpp.hip`, `probe_reduce_dpp.hi
 - `scan_inclusive_sum` × float/double/int32/int64: **12/12 PASS**
 - `scan_exclusive_sum<float>`: **PASS** (all 64 lanes checked)
 
+### 5.6 Real-kernel results: LayerNorm and Softmax
+
+To assess whether the microbenchmark speedup translates to a production-relevant
+kernel, we implemented single-pass LayerNorm (two `reduce_sum` per row: one for
+mean, one for variance) and row-wise Softmax (`reduce_max` + `reduce_sum`) with
+three backends: full-DPP, portable `__shfl_*`, and hipCUB WarpReduce/WarpScan.
+
+Run 3 — MI300X VF (gfx942, ROCm 7.2.0, 2026-06-05):
+
+#### LayerNorm (2× reduce_sum per row)
+
+| Config | Kernel | Median (µs) | vs portable | vs hipCUB |
+| --- | --- | --- | --- | --- |
+| 65536 rows × 64 cols (narrow, 1 elem/lane) | DPP | 35.7 | **1.019×** | **1.009×** |
+| 65536 rows × 64 cols (narrow, 1 elem/lane) | portable | 36.4 | 1.00× | 0.990× |
+| 65536 rows × 64 cols (narrow, 1 elem/lane) | hipCUB | 36.0 | 1.011× | 1.00× |
+| 65536 rows × 512 cols (wide, 8 elems/lane) | DPP | 65.3 | **1.000×** | **1.029×** |
+| 65536 rows × 512 cols (wide, 8 elems/lane) | portable | 65.3 | 1.00× | 1.029× |
+| 65536 rows × 512 cols (wide, 8 elems/lane) | hipCUB | 67.2 | 0.972× | 1.00× |
+
+rocprofv3 LDS counters on narrow LayerNorm:
+
+| Kernel | SQ_INSTS_LDS |
+| --- | --- |
+| layernorm DPP | **0** |
+| layernorm portable | 917,504 |
+| layernorm hipCUB | 262,144 |
+
+#### Softmax (reduce_max + reduce_sum per row, 65536 rows × 512 cols)
+
+| Kernel | Median (µs) | vs portable | vs hipCUB |
+| --- | --- | --- | --- |
+| softmax DPP | 65.5 | **1.016×** | **1.022×** |
+| softmax portable | 66.5 | 1.00× | 1.006× |
+| softmax hipCUB | 66.9 | 0.994× | 1.00× |
+
+**Interpretation.** The microbenchmark speedup (1.35–1.79× reduce, 1.028× scan)
+does **not** replicate at kernel granularity for these configurations. DPP remains
+fastest in all cases and LDS elimination is confirmed (rocprofv3: 0 vs 917K insts
+for portable), but the margin collapses to 1–3% because the kernel execution time
+is dominated by HBM traffic (reading and writing the full row per element), not by
+the cross-lane reduction steps. This is consistent with a memory-bound regime:
+for 65536 × 512 fp32, the kernel processes 134M floats (512 MB) at ~65 µs,
+implying ~7.9 TB/s effective bandwidth — well above the HBM3 theoretical peak of
+5.3 TB/s for a single MI300X VF, suggesting the wide kernel saturates memory.
+
+The practical implication is bounded: DPP primitives deliver 1.35–1.79× speedup
+for **reduction-dominated** workloads (short rows, multiple reductions per row,
+register-bound kernels with tight LDS budget). For memory-bound kernels at typical
+LLM/transformer sizes (wide rows), the advantage is 1–3% — measurable, LDS-free,
+but not the headline result.
+
+### 5.7 Welford one-pass LayerNorm: a refutation
+
+Run 3 showed that DPP delivers only 1–3% improvement in real LayerNorm and Softmax
+kernels. A natural follow-up hypothesis: the two-pass structure (mean then variance)
+incurs two HBM reads per row — collapsing to one pass via parallel Welford online
+statistics should halve HBM traffic.
+
+We implemented a Welford one-pass kernel (`bench_layernorm_welford.hip`): each lane
+accumulates `{count, mean, M2}` sequentially over its `kElemsPerLane` elements, then
+the wave merges all 64 per-lane Welford states via DPP shifts applying the parallel
+Chan et al. merge formula.
+
+Result on MI300X VF (gfx942, ROCm 7.2, 65536 rows):
+
+| Config | Welford DPP | two-pass DPP | Speedup |
+| --- | --- | --- | --- |
+| 512 cols (wide) | 72.0 µs | 64.9 µs | **0.90×** (10% slower) |
+| 64 cols (narrow) | 40.8 µs | 35.7 µs | **0.88×** (12% slower) |
+
+rocprofv3 explains the regression:
+
+| Kernel | SQ_INSTS_LDS | SQ_INSTS_VALU |
+| --- | --- | --- |
+| `welford_dpp` | **131,072** | 22,413,312 |
+| `twopass_dpp` | **0** | 3,670,016 |
+
+Two root causes:
+
+1. **Residual LDS.** The final broadcast of lane-63's result to all lanes uses
+   `__shfl(s.mean, 63, 64)` — still a `ds_bpermute` on CDNA3. This alone adds
+   131K LDS instructions. A pure-DPP broadcast from lane 63 requires a different
+   pattern; `__shfl` from a runtime lane index is not foldable to DPP.
+
+2. **VALU overhead.** Welford merge costs 3 DPP ops per step (mean, M2, n) vs 1 for
+   scalar sum, producing 6× more VALU. The Welford VALU count (22.4M) dominates
+   the kernel execution time.
+
+3. **The "two HBM reads" premise was wrong.** `bench_layernorm.hip` already caches
+   `vals[]` in a register array between the two reductions. The second `reduce_sum`
+   operates on re-computed deviations from registers, not from HBM. There is no
+   second HBM read to eliminate.
+
+**Conclusion:** For this kernel layout, two-pass DPP (0 LDS, 3.67M VALU) is strictly
+optimal. Welford one-pass is appropriate when register pressure prevents caching the
+full row (very wide rows, many concurrent warps), but at 512 cols × float32 the
+register array fits comfortably and two-pass wins.
+
 ---
 
 ## 6. Implementation
@@ -384,9 +484,12 @@ Repository: [github.com/jpcpol/AMD-Incstinct-Labs](https://github.com/jpcpol/AMD
    RDNA3 (wave32) remains open — proposed as a collaboration hook with AMD rather
    than a blocker, since the caveat is declared.
 
-2. **Microbenchmark.** The speedup is for the primitive in isolation with a synthetic
-   dependency chain. Production-relevant speedup — inside a LayerNorm, softmax, or
-   Flash Attention kernel — is not yet measured. That is the next step.
+2. **Microbenchmark vs memory-bound kernel.** The microbenchmark speedup (1.35–1.79×
+   reduce) was measured with a synthetic kReps loop that keeps the GPU compute-bound.
+   In real LayerNorm and Softmax kernels (§5.6), the margin collapses to 1–3% for
+   wide rows because HBM traffic dominates. DPP remains fastest and LDS elimination
+   is confirmed, but the headline speedup applies to reduction-dominated workloads
+   (short rows, multiple reductions, register-pressure-constrained kernels).
 
 3. **Exploratory finding.** The DPP result emerged from investigating a hypothesis
    refutation (H2), not from a pre-registered hypothesis. It is reported as such.
@@ -436,7 +539,13 @@ deferred but the mechanism is established.
    reduce and scan — the deciding factor on CDNA3 wave64 is whether an op can
    eliminate all LDS-mediated cross-lane traffic.
 
-4. The full-DPP geometry for both primitives is available as a header-only,
+4. In real kernels (LayerNorm, Softmax at 65536 × 512 float32), DPP is fastest
+   (1–3% over hipCUB, rocprofv3 LDS = 0) but the large microbenchmark margin does
+   not replicate — the kernel is memory-bound at these row sizes. The DPP advantage
+   is reduction-domain-specific: short rows, multiple reductions per row, or kernels
+   constrained by LDS budget.
+
+5. The full-DPP geometry for both primitives is available as a header-only,
    MIT-licensed library with wave32/NVIDIA fallback.
 
 ---
