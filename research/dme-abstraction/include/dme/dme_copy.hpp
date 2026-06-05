@@ -113,9 +113,11 @@ __device__ __forceinline__ void copy_tile_1d(
         "copy_tile_1d: kElems should be a multiple of wave size or ≤ 64");
     const int lane = __builtin_amdgcn_mbcnt_hi(~0u, __builtin_amdgcn_mbcnt_lo(~0u, 0u));
     // Each lane copies one element per iteration.
+    // offset param applies to BOTH ptrs inside the builtin (confirmed by probe_dme).
+    // Pass the base pointers and let offset drive both src and dst advancement.
     #pragma unroll
     for (int i = lane; i < kElems; i += 64) {
-        copy_element<T>(src + i, dst_lds, i * sizeof(T));
+        copy_element<T>(src, dst_lds, i * sizeof(T));
     }
 }
 
