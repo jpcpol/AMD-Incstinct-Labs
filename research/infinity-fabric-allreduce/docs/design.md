@@ -72,11 +72,30 @@ Both phases are `O(D/N / B)` instead of Ring's `O(D·(N-1)/N / B)`.
 
 1. **Topology probe** — query xGMI link map (`rocm-smi --shownodesbw` /
    `hipDeviceGetP2PAttribute`). Confirm full-mesh and per-link bandwidth.
+   **→ WRITTEN (cold): [`tests/probe_xgmi_topology.hip`](../tests/probe_xgmi_topology.hip).**
+   It enumerates the P2P matrix, perf ranks, and — critically — measures whether
+   GPU0 broadcasting to k peers on k streams scales with k (concurrent links) or
+   stays flat (runtime serialization). This is the first thing to run on a
+   multi-GPU node; it gates the entire design (see Open risk #1).
 2. **Point-to-point primitive** — `hipMemcpyPeerAsync` or direct xGMI store on
    `N-1` streams, one per peer link, to drive all links concurrently.
 3. **Mesh reduce-scatter** — the N-way parallel shard exchange + local reduce.
 4. **Mesh all-gather** — the N-way parallel shard broadcast.
 5. **Benchmark vs RCCL** — `all_reduce_perf` from rccl-tests as the baseline.
+
+### Execution plan for the (expensive) multi-GPU run
+
+The 8× node is ~8× hourly cost and billed per started hour — so the run must be
+one tight session with everything pre-staged:
+
+1. Boot, `git pull`, compile `probe_xgmi_topology` + the AllReduce kernel.
+2. Run the probe FIRST. **Decision gate:**
+   - per-link BW constant as k grows → links concurrent → proceed to mesh AllReduce.
+   - aggregate BW flat → serialized → abort the run, pivot the design in cold,
+     do NOT burn node-hours on a kernel that can't win.
+3. If gate passes: run mesh reduce-scatter + all-gather, benchmark vs `rccl-tests`
+   `all_reduce_perf` across message sizes (1 MB … 1 GB).
+4. Capture results to `results/`, power off immediately.
 
 ## Why this is deferred to last
 

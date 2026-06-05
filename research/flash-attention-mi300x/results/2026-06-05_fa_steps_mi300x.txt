@@ -1,0 +1,50 @@
+================================================================================
+Flash Attention build-order results — MI300X VF (gfx942), ROCm 7.2
+Session 2026-06-05  |  Config: Br=16 Bc=64 D=64 seqQ=seqK=512 heads=8 batch=1
+================================================================================
+
+All kernels: correctness PASS (max|gpu-ref| < 0.0001 vs fp32 CPU reference).
+
+--- Step results ---------------------------------------------------------------
+Step  Kernel     Q·Kᵀ/P·V       Softmax            K/V load     Median  TFLOPS  Speedup
+1     fa_naive   dot product    __shfl_down        synchronous  97.2µs  5.52    1.000x
+2     fa_dpp     dot product    DPP (0 LDS)        synchronous  90.5µs  5.93    1.074x
+3     fa_dme     dot product    DPP (0 LDS)        DME async    82.4µs  6.52    1.180x  <- optimal
+4     fa_mfma2   MFMA 16x16x16  LDS (lanes 0-15)   synchronous  87.0µs  6.17    1.118x
+
+Step 3 detail: 814.5 GB/s HBM. DME async prefetch (K_{j+1}+V_{j+1}) overlaps
+  with the 64-iter P·V compute. LDS 36 KB (2×K_buf + 2×V_buf + O_lds).
+
+Step 4 (NEGATIVE result, honest): MFMA does NOT beat Step 3 at D=64.
+  Cause: 16x16x16 tiles too small to saturate matrix cores; 1-wave layout
+  idles 48/64 lanes during softmax. MFMA needs large D + head-batching to win.
+  Required a 1-wave-per-block rewrite (fa_mfma2.hip); the first Br-warps
+  attempt (fa_mfma.hip) failed structurally.
+
+--- rocprofv3 hardware counters (one dispatch) ---------------------------------
+Kernel     SQ_INSTS_LDS         SQ_INSTS_VALU        SQ_INSTS_VMEM_RD
+fa_naive   5,316,608            9,912,320            311,296
+fa_dpp     4,857,856 (-8.6%)    10,641,408 (+7.3%)   303,104  (-2.6%)
+fa_dme     4,595,712 (-13.6%)   10,067,968 (+1.6%)   172,032  (-44.7%)
+
+  DPP softmax removes ds_bpermute → LDS -8.6%, VALU +7.3% (net faster).
+  DME prefetch (sc0 streaming) → VMEM_RD -44.7% (hardware signature of overlap).
+
+--- Bc tile-size sweep (seqLen=576, divisible by 32/64/96) ----------------------
+Config  Bc   LDS    Median   TFLOPS   Speedup   kv_iters
+Bc=32   32   20KB   100.6µs  6.75     0.837x    18
+Bc=64   64   36KB   84.2µs   8.07     1.000x    9      <- optimal (Bc = wave_size)
+Bc=96   96   52KB   86.5µs   7.85     0.973x    6
+
+  Hypothesis "more freed LDS → bigger Bc → faster" REFUTED. Limit is the
+  lane↔key mapping efficiency at Bc≠wave_size, not the LDS budget. Sweet
+  spot is Bc = wave_size = 64.
+
+--- Verified MFMA wave64 lane mapping (probe_mfma_mapping.hip) -------------------
+Full 16x16x16 GEMM vs host ref, all layout combos enumerated; only one matched
+(err 0.001):
+  A  input : lane L, frag f -> A[row = L%16      ][k   = (L/16)*4 + f]   [idx16][quad]
+  B  input : lane L, frag f -> B[k   = (L/16)*4+f][col = L%16        ]   [quad][idx16]
+  C/D out  : lane L, frag f -> C[row = (L/16)*4+f][col = L%16        ]   [quad][idx16]
+
+================================================================================

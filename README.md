@@ -42,11 +42,49 @@ reduction (1.79× vs hipCUB) and scan (~parity, 1.028×), making this look
 architectural rather than algorithm-specific.
 
 Generalized across **float/double/int32/int64 × sum/max/min** — 12/12 correctness PASS.
+For low-precision types, **float32 accumulation is the correct default — and faster**:
+`__half` fp32-acc is 10% faster than native fp16, and `bf16` fp32-acc is 62% faster
+than native bf16 (the bf16 path round-trips through float per step on gfx942). Both
+win on speed *and* accuracy — not a tradeoff.
 
-**Caveats:** virtualized MI300X, clocks unpinned, single hardware point (no MI250/RDNA3),
-microbenchmark only (no real-kernel demonstration yet). Stated as a bounded claim, not
-a general "we beat hipCUB" assertion. Open items tracked in
+**Caveats:** virtualized MI300X, clocks unpinned, single hardware point (no MI250/RDNA3).
+Stated as a bounded claim, not a general "we beat hipCUB" assertion. The microbenchmark
+speedup is reduction-domain-specific — see the Flash Attention results below for the
+real-kernel picture. Open items tracked in
 [`docs/research-outline.md §10.10`](docs/research-outline.md).
+
+---
+
+## Flash Attention on MI300X (real-kernel validation)
+
+The wave-primitives are validated in a production-relevant kernel. Flash Attention
+(FA2) is built in four independently-testable steps; all PASS correctness
+(`max|gpu − ref| < 0.0001`). Config: Br=16, Bc=64, D=64, seqLen=512, 8 heads.
+
+| Step | Kernel | Q·Kᵀ / P·V | Softmax | K/V load | Median | Speedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `fa_naive` | dot product | `__shfl_down` | sync | 97.2 µs | 1.000× |
+| 2 | `fa_dpp` | dot product | DPP (0 LDS) | sync | 90.5 µs | 1.074× |
+| 3 | `fa_dme` | dot product | DPP (0 LDS) | **DME async** | **82.4 µs** | **1.180×** |
+| 4 | `fa_mfma2` | MFMA 16×16×16 | LDS | sync | 87.0 µs | 1.118× |
+
+**18% cumulative speedup** from DPP softmax + DME async prefetch (Step 3 is fastest).
+rocprofv3 attributes −8.6% LDS to DPP and **−44.7% VMEM reads** to DME overlap.
+
+Reported honestly with the negative results:
+
+- **MFMA does not help at head dim 64** (Step 4 is 0.95× vs Step 3): the 16×16×16
+  tiles are too small to saturate the matrix cores. But a head-dim sweep confirms
+  the cause — at **D=128 the MFMA kernel reaches 10.45 TFLOPS vs 6.19 at D=64
+  (+69%)**: the matrix cores scale strongly once the tiles are large enough. MFMA's
+  weakness was small heads, not MFMA itself.
+- **A Bc tile-size sweep refutes** the "freeing LDS enables bigger tiles" hypothesis:
+  Bc=64 (= wave size) is optimal; Bc=96 fits in LDS but is slower (lane↔key mapping cost).
+- **Welford one-pass LayerNorm is slower** than two-pass DPP (residual `__shfl` LDS +
+  higher VALU) — see [`docs/paper-draft.md §5.7`](docs/paper-draft.md).
+
+Reusable by-product: the empirically-verified `v_mfma_f32_16x16x16f16` wave64
+lane mapping for gfx942 ([`research/flash-attention-mi300x/tests/probe_mfma_mapping.hip`](research/flash-attention-mi300x/tests/probe_mfma_mapping.hip)).
 
 ---
 
@@ -54,10 +92,10 @@ a general "we beat hipCUB" assertion. Open items tracked in
 
 | Area | Status | Key finding / goal | Directory |
 | --- | --- | --- | --- |
-| **wave-primitives** | **Results on MI300X** | Full-DPP geometry eliminates LDS cross-lane traffic; 1.35–1.79× over hipCUB reduce, 1.028× scan | [`research/wave-primitives/`](research/wave-primitives/) |
-| flash-attention-mi300x | In progress | Flash Attention using DME async prefetch to overlap HBM loads with MFMA compute | [`research/flash-attention-mi300x/`](research/flash-attention-mi300x/) |
-| infinity-fabric-allreduce | Planned | Topology-aware AllReduce using all 7 Infinity Fabric links (vs Ring/Tree) | [`research/infinity-fabric-allreduce/`](research/infinity-fabric-allreduce/) |
-| dme-abstraction | Planned | C++ API over the CDNA3 Data Movement Engine — no equivalent in NVIDIA toolchain | [`research/dme-abstraction/`](research/dme-abstraction/) |
+| **wave-primitives** | **Validated on MI300X** | Full-DPP geometry eliminates LDS cross-lane traffic; 1.35–1.79× over hipCUB reduce, 1.028× scan | [`research/wave-primitives/`](research/wave-primitives/) |
+| **flash-attention-mi300x** | **Validated on MI300X** | 4 build-order steps; DPP softmax + DME prefetch give 18% end-to-end speedup (97.2 → 82.4 µs), all PASS | [`research/flash-attention-mi300x/`](research/flash-attention-mi300x/) |
+| **dme-abstraction** | **Validated on MI300X** | C++ API over the CDNA3 Data Movement Engine — semantics verified, async overlap −44.7% VMEM reads | [`research/dme-abstraction/`](research/dme-abstraction/) |
+| infinity-fabric-allreduce | Design ready (needs multi-GPU) | Topology-aware AllReduce using all 7 Infinity Fabric links (vs Ring/Tree) | [`research/infinity-fabric-allreduce/`](research/infinity-fabric-allreduce/) |
 | mlir-mfma-tiling | Planned | MLIR pass for automatic MFMA tile-size selection from GEMM shape | [`research/mlir-mfma-tiling/`](research/mlir-mfma-tiling/) |
 
 ---
@@ -195,10 +233,10 @@ The MI300X has hardware advantages that the current software stack does not expl
 
 | Hardware advantage | Current software reality |
 | --- | --- |
-| 5.3 TB/s HBM3 (1.58× H100) | Flash Attention ignores the Data Movement Engine — Q/K/V loads block compute |
+| 5.3 TB/s HBM3 (1.58× H100) | FA ignored the DME — **addressed: DME double-buffer prefetch, −44.7% VMEM reads** |
 | 7-link full-mesh Infinity Fabric | RCCL uses Ring/Tree AllReduce designed for linear PCIe topologies |
-| Wave64 SIMT (64-lane wavefront) | `__shfl_*` lowers to `ds_bpermute` (LDS) — **being addressed here** |
-| DME: async HBM→LDS tensor copies | No C++ API exists — only MLIR low-level intrinsics |
+| Wave64 SIMT (64-lane wavefront) | `__shfl_*` lowers to `ds_bpermute` (LDS) — **resolved: full-DPP, zero LDS, 1.35–1.79×** |
+| DME: async HBM→LDS tensor copies | No C++ API existed — **addressed: `dme_copy.hpp`, semantics verified on hardware** |
 | MI300A: 128 GB unified CPU+GPU HBM | No framework defines zero-copy CPU↔GPU programming patterns |
 | MFMA matrix units (FP8/BF16/FP32) | Tile size for GEMM lowering is manual — no cuBLAS-equivalent auto-tuning |
 

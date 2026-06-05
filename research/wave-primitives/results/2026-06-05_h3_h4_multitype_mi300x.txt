@@ -1,0 +1,48 @@
+================================================================================
+H3 / H4 / multi-type reduce — MI300X VF (gfx942), ROCm 7.2
+Session 2026-06-05  |  kReps amortized where noted
+================================================================================
+
+--- H3: fp32-accumulation overhead for __half reduce (bench_h3_fp16acc, kReps=4096)
+Strategy                      Median     Throughput
+__half (fp32 acc)             933.9µs    0.070 Ge/s
+__half (naive fp16, __hadd)   1038.7µs   0.063 Ge/s
+
+  Overhead: -10.1% (fp32-acc is FASTER, not slower).
+  H3 CONFIRMED and EXCEEDED (threshold was <10% overhead, falsify >15%).
+  On CDNA3 v_add_f32 < __hadd (fp16 needs pack/unpack on gfx942); shfl equal.
+  Promoting __half -> float32 for accumulation is strictly better:
+  lower latency AND higher accuracy. Accuracy (64×0.1f): both error 0.0016.
+
+--- H4: block reduce vs hipCUB BlockReduce (two-phase wave->LDS->wave) -----------
+Block size   wave (µs)   hipCUB (µs)   Ratio
+128          5.813       5.814         1.000x
+256          5.773       5.773         1.000x
+512          5.773       5.773         1.000x
+1024         5.773       5.773         1.000x
+
+  H4 CONFIRMED (parity within ±15%; measured exact 1.000x).
+  Delimits DPP scope: zero-LDS advantage is WAVE-scoped, not block-scoped.
+  Once an inter-wave LDS gather is needed, DPP and bpermute use the same
+  one-LDS-step strategy and converge.
+
+--- Multi-type reduce throughput (bench_reduce_dpp_types, kReps amortized) -------
+Type     reduce_sum   reduce_max   reduce_min     correctness
+float32  1157 Ge/s    558 Ge/s     558 Ge/s       PASS (sum/max/min)
+float64  531 Ge/s     367 Ge/s     367 Ge/s       PASS
+int32    1372 Ge/s    1378 Ge/s    1381 Ge/s       PASS
+int64    528 Ge/s     362 Ge/s     362 Ge/s       PASS
+
+  12/12 PASS. 64-bit path (direct update_dpp, backend splits to 2×32-bit)
+  works without the fallback split. float max/min slower than sum (identity
+  -inf not as foldable as 0); int32 all-equal as expected.
+
+--- Scan DPP-hybrid (bench_scan_dpp, kReps amortized) ---------------------------
+Kernel                              Median     vs portable   vs hipCUB
+scan portable (shfl_up/bpermute)    968.1µs    1.000x        0.366x
+scan DPP-hybrid (4 DPP + 3 shfl)    353.4µs    2.739x        1.004x
+hipCUB WarpScan::InclusiveSum       354.6µs    -             1.000x
+
+  H1 CONFIRMED: DPP scan matches/beats hipCUB (1.004x) and is 2.74x over portable.
+
+================================================================================
