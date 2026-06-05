@@ -463,3 +463,73 @@ fi
 
 log "All results saved to: $RESULTS/"
 log "Run complete: $(date)"
+
+# ---------------------------------------------------------------------------
+# TEARDOWN — destroy this droplet to stop billing.
+#
+# Requires: doctl CLI installed + auth token in env or ~/.config/doctl/
+# The droplet ID is read from /tmp/droplet_id (written by create_vm.sh).
+# Results are already on disk; rsync/scp them before this script exits if needed.
+# ---------------------------------------------------------------------------
+sep
+log ">>> TEARDOWN — destroying droplet to stop billing"
+
+# vm_id.txt is written by create_vm.sh on the local machine; the watch script
+# should scp it to the VM at /tmp/droplet_id, OR we can use the DigitalOcean
+# metadata API (always available inside a DO droplet) as a fallback.
+DROPLET_ID_FILE="/tmp/droplet_id"
+DOCTL_TOKEN_FILE="/tmp/do_token"   # scp'd by the watch/create script alongside vm_id.txt
+DOCTL_BIN=$(command -v doctl 2>/dev/null || true)
+
+# Prefer /tmp/droplet_id; fall back to DO metadata API (no auth needed, LAN only).
+if [ ! -f "$DROPLET_ID_FILE" ]; then
+    META_ID=$(curl -sf --max-time 3 http://169.254.169.254/metadata/v1/id || true)
+    if [ -n "$META_ID" ]; then
+        echo "$META_ID" > "$DROPLET_ID_FILE"
+        log "  Got droplet ID from metadata API: $META_ID"
+    fi
+fi
+
+if [ -z "$DOCTL_BIN" ]; then
+    # Try to use the DO API directly with curl if we have a token
+    if [ -f "$DOCTL_TOKEN_FILE" ] && [ -f "$DROPLET_ID_FILE" ]; then
+        DROPLET_ID=$(cat "$DROPLET_ID_FILE")
+        TOKEN=$(cat "$DOCTL_TOKEN_FILE")
+        log "  doctl not found — using curl to destroy droplet $DROPLET_ID ..."
+        sleep 10
+        HTTP=$(curl -s -o /tmp/do_delete_resp.txt -w "%{http_code}" \
+            -X DELETE -H "Authorization: Bearer $TOKEN" \
+            "https://api.digitalocean.com/v2/droplets/$DROPLET_ID")
+        if [ "$HTTP" = "204" ]; then
+            log "  ✓ Droplet $DROPLET_ID destroyed (HTTP 204). Billing stopped."
+            echo "TEARDOWN: droplet $DROPLET_ID destroyed at $(date)" >> "$RESULTS/decisions.txt"
+        else
+            log "  ✗ DELETE returned HTTP $HTTP — destroy manually"
+            echo "ACTION_REQUIRED: destroy droplet $DROPLET_ID manually (HTTP $HTTP)" >> "$RESULTS/decisions.txt"
+        fi
+    else
+        log "  WARNING: doctl not found and no token at $DOCTL_TOKEN_FILE. Destroy manually:"
+        log "    curl -X DELETE -H 'Authorization: Bearer TOKEN' https://api.digitalocean.com/v2/droplets/ID"
+        echo "ACTION_REQUIRED: destroy droplet manually (doctl not installed, no token file)" \
+            >> "$RESULTS/decisions.txt"
+    fi
+elif [ ! -f "$DROPLET_ID_FILE" ]; then
+    log "  WARNING: droplet ID unknown — destroy manually: doctl compute droplet list"
+    echo "ACTION_REQUIRED: destroy droplet manually (ID file missing)" \
+        >> "$RESULTS/decisions.txt"
+else
+    DROPLET_ID=$(cat "$DROPLET_ID_FILE")
+    log "  Droplet ID: $DROPLET_ID"
+    log "  Waiting 10s as final safety window before destroy..."
+    sleep 10
+    if "$DOCTL_BIN" compute droplet delete "$DROPLET_ID" --force 2>&1; then
+        log "  ✓ Droplet $DROPLET_ID destroyed. Billing stopped."
+        echo "TEARDOWN: droplet $DROPLET_ID destroyed at $(date)" \
+            >> "$RESULTS/decisions.txt"
+    else
+        log "  ✗ doctl delete failed — destroy manually:"
+        log "    doctl compute droplet delete $DROPLET_ID --force"
+        echo "ACTION_REQUIRED: destroy droplet $DROPLET_ID manually (doctl failed)" \
+            >> "$RESULTS/decisions.txt"
+    fi
+fi
