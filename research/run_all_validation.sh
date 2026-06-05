@@ -397,6 +397,23 @@ fi
 # 10. WAVE PRIMITIVES — bench_scan (portable scan vs hipCUB, no-kReps baseline)
 # ---------------------------------------------------------------------------
 sep
+log ">>> [9b/10] Reduce across all types incl fp16/bf16 (bench_all_types)"
+
+ATYPES_SRC="$ROOT/research/wave-primitives/benchmarks/bench_all_types.hip"
+ATYPES_BIN="$RESULTS/bench_all_types"
+if compile "bench_all_types" $SCAN_FLAGS "$ATYPES_SRC" -o "$ATYPES_BIN"; then
+    log "  Running bench_all_types (f32/f64/i32/i64/fp16/bf16) ..."
+    "$ATYPES_BIN" 2>&1 | tee "$RESULTS/bench_all_types_output.txt"
+    if grep -q "PASS\|wave_reduce" "$RESULTS/bench_all_types_output.txt"; then
+        ok "bench_all_types_ran"
+    else
+        err "bench_all_types" "unexpected output — check compile"
+    fi
+else
+    err "bench_all_types_compile" "hipcc failed"
+fi
+
+sep
 log ">>> [10/10] Scan correctness + portable vs hipCUB benchmark (bench_scan)"
 
 BSCAN_SRC="$ROOT/research/wave-primitives/benchmarks/bench_scan.hip"
