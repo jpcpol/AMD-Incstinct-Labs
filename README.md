@@ -1,105 +1,233 @@
 # AMD Instinct Labs
 
-Independent research targeting confirmed gaps between the ROCm software stack and the hardware capabilities of AMD Instinct MI300X (CDNA3, gfx942).
-
-The MI300X has meaningful hardware advantages over competing accelerators that remain unexploited at the software level. This project identifies each gap against AMD primary sources, implements a reference solution, benchmarks it against the current ROCm baseline, and contributes upstream.
-
----
-
-## The Problem
-
-AMD's MI300X is the highest-memory-bandwidth AI accelerator commercially available, yet the software stack consistently leaves performance on the table:
-
-| Hardware advantage | Current software reality |
-| --- | --- |
-| 5.3 TB/s HBM3 (1.58× H100) | Flash Attention ignores the Data Movement Engine — Q/K/V loads block compute |
-| 7-link full-mesh Infinity Fabric | RCCL uses Ring/Tree AllReduce designed for linear PCIe topologies |
-| Wave64 SIMT (64-lane wavefront) | Every CUDA warp-level primitive assumes 32 lanes — broken on CDNA without manual porting |
-| DME: async HBM→LDS tensor copies | No C++ API exists — only MLIR low-level intrinsics |
-| MI300A: 128 GB unified CPU+GPU HBM | No framework defines programming patterns for zero-copy CPU↔GPU algorithms |
-| MFMA matrix units (FP8/BF16/FP32) | Tile size selection for GEMM lowering is manual — no cuBLAS-equivalent auto-tuning |
-
-These are not speculative gaps. Each one is verified against AMD's own documentation, GitHub issues, and arXiv research. The full analysis with primary source citations is in [`docs/gap-analysis.md`](docs/gap-analysis.md).
+Independent research on the AMD Instinct MI300X (CDNA3, gfx942) — targeting
+confirmed gaps between the ROCm software stack and the hardware's actual capabilities.
 
 ---
 
-## Documentation
+## Navigation
 
-| Document | Description |
+| Where to go | What you'll find |
 | --- | --- |
-| [`docs/gap-analysis.md`](docs/gap-analysis.md) | Full gap analysis with per-gap status verified against AMD primary sources |
-| [`docs/research-outline.md`](docs/research-outline.md) | Research outline: hypotheses, methodology, metrics, and result placeholders — pre-registered before benchmark execution |
+| [Key Result](#key-result) | The main finding in one table |
+| [Research Areas](#research-areas) | Five areas, their status, and links |
+| [Repository Layout](#repository-layout) | Every directory and file explained |
+| [How to Run](#how-to-run) | Build, test, benchmark — one command |
+| [Methodology](#methodology) | How hypotheses, benchmarks, and claims work |
+| [Prior Work](#prior-work-and-relationship-to-existing-libraries) | What this adds vs hipCUB / CK / RCCL |
+| [Hardware](#hardware) | MI300X specifications |
+
+---
+
+## Key Result
+
+Measured on MI300X VF (gfx942, ROCm 7.2, hipCUB 4.2.0, 2026-06-03).
+Full methodology and caveats: [`docs/research-outline.md §10`](docs/research-outline.md).
+
+| Primitive (`float`, wave64) | Median (µs) | vs hipCUB | SQ_INSTS_LDS (rocprofv3) |
+| --- | --- | --- | --- |
+| `wave::dpp::reduce_sum` (full DPP, broadcast) | 279 | **1.35×** | **0** |
+| `wave::dpp::reduce_sum` (full DPP, lane-63) | 210 | **1.79×** | **0** |
+| `wave::dpp::scan_inclusive_sum` (full DPP) | 343 | **1.028×** | **0** |
+| hipCUB WarpReduce::Sum | 377 | 1.00× | 4.2M |
+| hipCUB WarpScan::InclusiveSum | 352 | 1.00× | 0 |
+| portable `__shfl_down` reduce | 922 | 0.41× | 25.2M |
+| portable `__shfl_up` scan | 966 | 0.36× | 25.2M |
+
+**The finding:** `__shfl_*` lowers to `ds_bpermute` on CDNA3 — every cross-lane
+step is an LDS round-trip. A full-DPP implementation stays on the cross-lane VALU
+datapath (`row_shr` in-row + `row_bcast` cascade cross-row), reaching
+**zero LDS traffic** by hardware counter. The same pattern holds for both
+reduction (1.79× vs hipCUB) and scan (~parity, 1.028×), making this look
+architectural rather than algorithm-specific.
+
+Generalized across **float/double/int32/int64 × sum/max/min** — 12/12 correctness PASS.
+
+**Caveats:** virtualized MI300X, clocks unpinned, single hardware point (no MI250/RDNA3),
+microbenchmark only (no real-kernel demonstration yet). Stated as a bounded claim, not
+a general "we beat hipCUB" assertion. Open items tracked in
+[`docs/research-outline.md §10.10`](docs/research-outline.md).
 
 ---
 
 ## Research Areas
 
-| Area | Status | What it solves |
-| --- | --- | --- |
-| [wave-primitives](research/wave-primitives/) | **First result on MI300X** | Header-only `reduce`/`scan`/`ballot`/`shuffle`, correct for wave32 and wave64. Key finding: a **full-DPP geometry eliminates LDS-mediated cross-lane traffic** (rocprofv3-measured 0 LDS) — reduction 1.35–1.79× over hipCUB, scan at parity. Bounded result, see Key Result below. |
-| [flash-attention-mi300x](research/flash-attention-mi300x/) | In progress | Flash Attention using DME async prefetch to overlap HBM loads with MFMA compute; FA3-style pipelining for AMD |
-| [infinity-fabric-allreduce](research/infinity-fabric-allreduce/) | Planned | Topology-aware AllReduce that uses all 7 Infinity Fabric links simultaneously instead of serializing through a ring |
-| [dme-abstraction](research/dme-abstraction/) | Planned | C++ API over the CDNA3 Data Movement Engine — the only CDNA3 feature with no NVIDIA equivalent and no usable interface |
-| [mlir-mfma-tiling](research/mlir-mfma-tiling/) | Planned | MLIR pass for automatic MFMA tile-size selection: analyze GEMM shape → select variant → emit optimal tiled code |
+| Area | Status | Key finding / goal | Directory |
+| --- | --- | --- | --- |
+| **wave-primitives** | **Results on MI300X** | Full-DPP geometry eliminates LDS cross-lane traffic; 1.35–1.79× over hipCUB reduce, 1.028× scan | [`research/wave-primitives/`](research/wave-primitives/) |
+| flash-attention-mi300x | In progress | Flash Attention using DME async prefetch to overlap HBM loads with MFMA compute | [`research/flash-attention-mi300x/`](research/flash-attention-mi300x/) |
+| infinity-fabric-allreduce | Planned | Topology-aware AllReduce using all 7 Infinity Fabric links (vs Ring/Tree) | [`research/infinity-fabric-allreduce/`](research/infinity-fabric-allreduce/) |
+| dme-abstraction | Planned | C++ API over the CDNA3 Data Movement Engine — no equivalent in NVIDIA toolchain | [`research/dme-abstraction/`](research/dme-abstraction/) |
+| mlir-mfma-tiling | Planned | MLIR pass for automatic MFMA tile-size selection from GEMM shape | [`research/mlir-mfma-tiling/`](research/mlir-mfma-tiling/) |
 
 ---
 
-## Key Result (MI300X VF, ROCm 7.2, 2026-06-03 — bounded experimental claim)
+## Repository Layout
 
-The strong finding is **not** wave-size portability — it is that the CDNA3 DPP
-datapath can replace LDS-mediated cross-lane communication *entirely*. For wave64
-reduction and scan, header-only DPP primitives reach **zero LDS traffic
-(rocprofv3-measured)**: reduction is clearly faster than hipCUB; scan reaches
-parity / a slight edge. The same pattern in two independent algorithms is what
-makes this look architectural, not algorithm-specific.
+```text
+amd-instinct-labs/
+│
+├── README.md                          ← this file (index)
+├── CONTRIBUTING.md                    ← contribution rules (benchmarks required)
+├── CMakeLists.txt                     ← root build (HIP/CMake 3.21+)
+│
+├── docs/
+│   ├── gap-analysis.md                ← 8 gaps verified against AMD primary sources
+│   └── research-outline.md            ← pre-registered hypotheses + Run 1/2 results (§10)
+│
+├── benchmarks/
+│   └── README.md                      ← benchmark protocol (warmup, kReps, statistics)
+│
+└── research/
+    │
+    ├── wave-primitives/               ← ACTIVE — first results available
+    │   ├── README.md                  ← area overview, result table, geometry explanation
+    │   ├── include/wave_primitives/
+    │   │   ├── wave_reduce_dpp.hpp    ← full-DPP reduce (sum/max/min × 4 types)
+    │   │   ├── wave_scan_dpp.hpp      ← full-DPP scan (inclusive/exclusive)
+    │   │   └── detail/config.hpp      ← WP_AMD / WP_NVIDIA compile-time detection
+    │   ├── tests/
+    │   │   ├── probe_scan_dpp.hip     ← lane-by-lane scan correctness (4 types × 4 ops)
+    │   │   ├── probe_reduce_dpp.hip   ← lane-by-lane reduce correctness
+    │   │   └── probe_dpp_bcast_map.hip← empirical DPP control-code → lane routing
+    │   ├── benchmarks/
+    │   │   ├── bench_reduce_dpp.hip   ← reduce timing vs hipCUB WarpReduce
+    │   │   ├── bench_reduce_dpp_types.hip ← f32/f64/i32/i64 × sum/max/min
+    │   │   ├── bench_scan_dpp.hip     ← scan timing vs hipCUB WarpScan
+    │   │   └── bench_block_reduce.hip ← two-phase block reduce vs hipCUB BlockReduce
+    │   └── scripts/
+    │       └── run_all_validation.sh  ← compile + run all probes + benchmarks in one pass
+    │
+    ├── flash-attention-mi300x/        ← IN PROGRESS
+    │   ├── README.md
+    │   └── docs/design.md             ← FA3-style DME pipeline design
+    │
+    ├── dme-abstraction/               ← PLANNED
+    │   └── README.md
+    │
+    ├── infinity-fabric-allreduce/     ← PLANNED
+    │   ├── README.md
+    │   └── docs/design.md
+    │
+    └── mlir-mfma-tiling/              ← PLANNED
+        └── README.md
+```
 
-| Primitive (`<float>`, wave64) | DPP median | vs hipCUB | LDS (measured) |
-| --- | --- | --- | --- |
-| `wave::dpp::reduce_sum` (full DPP) | 210–279 µs | **1.35–1.79×** | **0** |
-| `wave::dpp::scan_inclusive_sum` (full DPP) | 343 µs | **1.028×** | **0** |
-| (portable `__shfl` baselines) | 922 / 966 µs | 0.36–0.41× | 25.2M |
-| (hipCUB WarpReduce / WarpScan) | 377 / 352 µs | 1.00× | 4.2M / 0 |
+---
 
-Generalized across **float/double/int32/int64 × sum/max/min** (12/12 correct).
+## How to Run
 
-**Why (the part that generalizes):** the generic HIP `__shfl_*` routes every
-cross-lane step through Local Data Share (`ds_bpermute`). The DPP path keeps the
-whole wave64 operation on the cross-lane VALU datapath — in-row via `row_shr`,
-cross-row/bank via `row_bcast` cascades — reaching **zero `ds_bpermute`**.
-rocprofv3 measures `SQ_INSTS_LDS = 0` for both DPP primitives vs 25.2M for the
-portable path, with near-identical VALU — isolating LDS elimination as the cause.
-The unifying rule: *whoever removes all LDS-mediated cross-lane traffic wins on
-CDNA3 wave64*. For reduction the margin is large (1.35–1.79×); for scan it is
-narrow (~3%, i.e. **comparable to or slightly above** an already well-optimized
-hipCUB WarpScan that is itself full-DPP). The value of the scan result is the
-*repetition* of the pattern, not its margin.
+**Requirements:** ROCm 7.0+, CMake 3.21+
 
-**What this is and isn't.** Still a *bounded* result: a **virtualized** MI300X,
-clocks unpinned, and CDNA3-vs-gfx942 generality untested (no MI250/RDNA3 access).
-It is **not** a blanket "we beat hipCUB" claim, and the scan margin specifically
-is small. Biggest open gap: **no real-kernel demonstration yet** (the speedup is
-shown for the primitives in isolation, not inside LayerNorm/Flash Attention).
-Open items are tracked in [`docs/research-outline.md` §10.10](docs/research-outline.md).
-That said, any ROCm code reducing via `__shfl_down` (much of the PyTorch/JAX/vLLM
-HIP surface) routes cross-lane traffic through LDS, so the direction of the
-finding has broad reach.
+> ROCm 7.0+ is required: `warpSize` is early-folded by the compiler, enabling
+> full loop unrolling without template dispatch. ROCm 7.2 is the tested version.
 
-Full data, methodology, and the (refuted) pre-registered hypothesis that led here:
-[`docs/research-outline.md` §10](docs/research-outline.md).
+### Full validation suite (recommended — runs on AMD Developer Cloud)
+
+```bash
+git clone https://github.com/jpcpol/AMD-Incstinct-Labs.git
+cd AMD-Incstinct-Labs/research/wave-primitives
+bash scripts/run_all_validation.sh
+```
+
+Compiles all probes and benchmarks with `hipcc`, runs correctness first, then
+benchmarks. Results saved to `results/`. Typical runtime < 10 minutes on MI300X.
+
+### CMake build
+
+```bash
+cmake -B build -DGPU_TARGETS=gfx942 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+```
+
+### Quick single-file correctness check (no CMake)
+
+```bash
+hipcc -O3 --offload-arch=gfx942 \
+      -I research/wave-primitives/include \
+      research/wave-primitives/tests/probe_scan_dpp.hip \
+      -o probe_scan_dpp && ./probe_scan_dpp
+```
+
+Expected output on MI300X:
+
+```text
+  f32 sum/max/min/excl ALL PASS
+  i32 sum/max/min/excl ALL PASS
+  f64 sum/max/min/excl ALL PASS
+  i64 sum/max/min/excl ALL PASS
+
+ALL TYPES/OPS PASS
+```
+
+---
+
+## Testing on AMD Developer Cloud
+
+All benchmarks run on [AMD Developer Cloud](https://www.amd.com/en/developer/resources/cloud-access/amd-developer-cloud.html)
+— AMD's own MI300X cloud ($1.99/hr). New accounts receive $100 via the
+[AMD AI Developer Program](https://www.amd.com/en/developer/ai-dev-program.html).
+
+Recommended image: **Vanilla ROCm** (Ubuntu 24.04, ROCm 7.2). Full suite runs in
+under 10 minutes.
 
 ---
 
 ## Methodology
 
-Each research area follows a five-step process: confirm the gap against primary sources → survey existing implementations → implement targeting gfx942 → benchmark against the ROCm baseline (p50/p99 latency, rocprofv3 hardware counters) → contribute upstream via arXiv preprint + AMD GitHub Discussion + PR.
+Each research area follows five steps:
 
-Hypotheses are pre-registered before benchmark execution to prevent result-driven framing. For the full methodology, benchmark protocol, and per-hypothesis success criteria see [`docs/research-outline.md`](docs/research-outline.md).
+1. Confirm the gap against AMD primary sources (ISA reference, ROCm docs, GitHub issues)
+2. Survey existing implementations (hipCUB, Composable Kernel, RCCL, arXiv)
+3. Implement targeting gfx942 — header-only where possible
+4. Benchmark against the ROCm baseline: p50/p99 latency + rocprofv3 hardware counters
+5. Contribute upstream: arXiv preprint + AMD GitHub Discussion + PR
+
+Hypotheses are **pre-registered before benchmark execution** to prevent
+result-driven framing. The full pre-registration, outcomes (including refutations),
+and open questions are in [`docs/research-outline.md`](docs/research-outline.md).
+
+---
+
+## The Gaps
+
+The MI300X has hardware advantages that the current software stack does not exploit:
+
+| Hardware advantage | Current software reality |
+| --- | --- |
+| 5.3 TB/s HBM3 (1.58× H100) | Flash Attention ignores the Data Movement Engine — Q/K/V loads block compute |
+| 7-link full-mesh Infinity Fabric | RCCL uses Ring/Tree AllReduce designed for linear PCIe topologies |
+| Wave64 SIMT (64-lane wavefront) | `__shfl_*` lowers to `ds_bpermute` (LDS) — **being addressed here** |
+| DME: async HBM→LDS tensor copies | No C++ API exists — only MLIR low-level intrinsics |
+| MI300A: 128 GB unified CPU+GPU HBM | No framework defines zero-copy CPU↔GPU programming patterns |
+| MFMA matrix units (FP8/BF16/FP32) | Tile size for GEMM lowering is manual — no cuBLAS-equivalent auto-tuning |
+
+Full analysis with primary source citations: [`docs/gap-analysis.md`](docs/gap-analysis.md).
+
+---
+
+## Prior Work and Relationship to Existing Libraries
+
+This project does not replace hipCUB, Composable Kernel, or RCCL. It targets
+the specific gaps those libraries leave open:
+
+- **hipCUB WarpReduce/WarpScan**: correct and fast, but uses DPP + 1 residual
+  `ds_bpermute` for the 32-lane bank cross. Our `row_bcast31` step avoids it —
+  1.35–1.79× faster for reduce on MI300X (§10.3). No standalone header-only API.
+- **Composable Kernel**: high-performance GEMM and attention, but no public
+  DME abstraction layer.
+- **RCCL**: functional AllReduce, but Ring/Tree topology assumptions leave
+  bandwidth on the table for Infinity Fabric full-mesh clusters.
+- **HipKittens** (HazyResearch, arXiv 2511.08083, 2025): tile-level framework
+  for GEMM/attention on CDNA3, no wave-level primitives. Key finding incorporated
+  here: wave specialization achieves only ~80% peak FLOPS on CDNA3 due to static
+  register allocation — all primitives here use uniform wave patterns.
 
 ---
 
 ## Hardware
 
-**Primary target**: AMD Instinct MI300X
+**Primary target:** AMD Instinct MI300X
 
 | Specification | Value |
 | --- | --- |
@@ -113,83 +241,15 @@ Hypotheses are pre-registered before benchmark execution to prevent result-drive
 | L2 cache | 32 MB aggregate |
 | Infinity Fabric links | 7 bidirectional per GPU |
 
-**Secondary target**: AMD Instinct MI300A (same gfx942, 128 GB HBM3 shared with Zen 4 CPU)
-
----
-
-## Build
-
-**Requirements**: ROCm 7.0+, CMake 3.21+
-
-> ROCm 7.0+ is required for `warpSize` early-fold — the compiler mechanism that enables loop unrolling without template dispatch. ROCm 7.2 is the tested version.
-
-```bash
-git clone https://github.com/jpcpol/AMD-Incstinct-Labs.git
-cd AMD-Incstinct-Labs
-
-cmake -B build -DGPU_TARGETS=gfx942 -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
-```
-
-**Full test + benchmark suite** (recommended on AMD Developer Cloud):
-
-```bash
-cd research/wave-primitives
-chmod +x scripts/run_all.sh
-./scripts/run_all.sh        # compiles, runs all tests and benchmarks, saves to results/
-```
-
-**Quick single-file correctness test** (no CMake):
-
-```bash
-hipcc -O2 --offload-arch=gfx942 \
-      -I research/wave-primitives/include \
-      research/wave-primitives/tests/test_correctness.hip \
-      -o test_correctness
-./test_correctness
-```
-
-Expected output on MI300X:
-
-```
-[ENV]  warpSize = 64 (wave64 detected)
-[PASS] reduce_sum  float
-[PASS] reduce_sum  double
-[PASS] reduce_max  float
-[PASS] reduce_min  float
-[PASS] scan_inclusive_sum
-[PASS] scan_exclusive_sum
-[PASS] ballot  (mask = 0x5555555555555555)
-[PASS] popcount  (cnt = 32)
-All tests passed.
-```
-
----
-
-## Testing on AMD Developer Cloud
-
-All benchmarks in this project are designed to run on [AMD Developer Cloud](https://www.amd.com/en/developer/resources/cloud-access/amd-developer-cloud.html) — AMD's own MI300X cloud for developers ($1.99/hour per GPU). New accounts receive $100 in credits via the [AMD AI Developer Program](https://www.amd.com/en/developer/ai-dev-program.html).
-
-Recommended setup: **Vanilla ROCm** image (Ubuntu 24.04, ROCm 7.2), accessed via SSH. The full benchmark suite runs in under 10 minutes.
-
----
-
-## Prior Work and Relationship to Existing Libraries
-
-This project does not replace hipCUB, Composable Kernel, or MIOpen. It targets the gaps those libraries leave:
-
-- **hipCUB**: excellent block- and warp-level primitives, but does not provide a standalone *header-only* wave-level API correct for both wave32 and wave64. Its `WarpReduce` uses the DPP datapath yet still emits a residual `ds_bpermute` for the 32-lane bank cross; our full-DPP reduction avoids it (`row_bcast31`) and is 1.35–1.79× faster on MI300X (see Key Result)
-- **Composable Kernel**: high-performance GEMM and attention kernels, but no public DME abstraction layer
-- **RCCL**: functional AllReduce, but Ring/Tree topology assumptions leave bandwidth on the table for Infinity Fabric full-mesh clusters
-- **HipKittens** (HazyResearch, 2025): tile-level framework for GEMM/attention, does not expose wave-level primitives
-
-Key finding from HipKittens incorporated here: wave specialization (dedicated producer/consumer waves) achieves only ~80% peak on CDNA3 due to AMD's static register allocation. All primitives in this library use uniform wave patterns.
+**Secondary target:** AMD Instinct MI300A (same gfx942, 128 GB HBM3 shared with Zen 4 CPU)
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Short version: open an issue with the gap you want to target, include the primary source confirming it's open, and propose a measurable outcome. PRs without benchmarks are not accepted.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Short version: open an issue with the
+gap you want to target, include the primary source confirming it is open, and
+propose a measurable outcome. PRs without benchmarks are not accepted.
 
 ## License
 
