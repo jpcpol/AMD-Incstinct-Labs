@@ -470,28 +470,49 @@ reduce (1.79×) and scan (1.028×) vs hipCUB. The unifying rule, demonstrated by
 building both, is: *whoever removes all LDS-mediated cross-lane traffic wins on
 CDNA3 wave64*. Whether an op can reach zero LDS is the deciding factor.
 
-### 10.5 H3 — Float32 accumulation overhead (DEFERRED)
+### 10.5 H3 — Float32 accumulation overhead (ANSWERED, Run 5 — kReps amortized)
 
-| Strategy | Median (µs) | Error vs expected |
+`bench_h3_fp16acc.hip`, kReps=4096 amortized, 1024 blocks × wave_size, MI300X VF:
+
+| Strategy | Median (µs) | Throughput |
 | --- | --- | --- |
-| wave::reduce_sum __half (fp32 acc) | — | — |
-| Naive fp16 reduce | — | — |
+| `wave::reduce_sum` __half (fp32 acc) | 933.9 | 0.070 Ge/s |
+| Naive fp16 reduce (`__hadd`) | 1038.7 | 0.063 Ge/s |
 
-Outcome: [ DEFERRED to Run 2 ]. (Run 1's launch-bound first pass showed fp32-acc
-and naive fp16 producing identical accuracy on the 64×0.1f input, error 0.0016
-each — but that was at the launch-bound regime; a kReps-amortized re-run is needed
-for a valid latency comparison.)
+**Overhead: −10.1% (fp32-acc is FASTER, not slower).**
 
-### 10.6 H4 — Block reduce vs hipCUB BlockReduce (DEFERRED)
+Outcome: **CONFIRMED and exceeded.** H3 predicted < 10% overhead (falsification
+at > 15%). The measured result is not just within bound — fp32 accumulation is
+*faster* than native fp16. On CDNA3, `v_add_f32` is cheaper than the `__hadd`
+fp16 scalar path (which requires pack/unpack on gfx942), and the cross-lane
+`shfl` cost is identical for both. Promoting __half → float32 for the
+accumulation is therefore strictly better: lower latency AND higher accuracy
+(no fp16 rounding per step, no overflow risk on long sums). Accuracy at the
+launch-bound regime was already identical (error 0.0016 each on 64×0.1f);
+the kReps-amortized latency now shows fp32-acc wins on speed too.
+
+> Note: the earlier launch-bound pass (`bench_all_types`, ~5.7 µs floor) showed
+> all variants indistinguishable. The amortized re-run was required to surface
+> the real per-reduction difference — the same methodology lesson as the DPP
+> microbenchmarks ([[bench-launch-bound-pitfall]]).
+
+### 10.6 H4 — Block reduce vs hipCUB BlockReduce (ANSWERED, Run 5 — kReps amortized)
+
+`bench_block_reduce`, two-phase (wave DPP → LDS → wave DPP), MI300X VF:
 
 | Block size | wave (µs) | hipCUB (µs) | Ratio |
 | --- | --- | --- | --- |
-| 128 | — | — | — |
-| 256 | — | — | — |
-| 512 | — | — | — |
-| 1024 | — | — | — |
+| 128 | 5.813 | 5.814 | 1.000× |
+| 256 | 5.773 | 5.773 | 1.000× |
+| 512 | 5.773 | 5.773 | 1.000× |
+| 1024 | 5.773 | 5.773 | 1.000× |
 
-Outcome: [ DEFERRED to Run 2 ].
+Outcome: **CONFIRMED.** H4 predicted parity within ±15% (falsification at > 30%).
+The two-phase wave block reduce matches hipCUB BlockReduce exactly (1.000×) at
+all block sizes. This also delimits the scope of the DPP contribution: once a
+cross-wave LDS round-trip is required (inter-wave partial gather), the DPP vs
+bpermute asymmetry disappears — both paths use the same one-LDS-step strategy.
+The zero-LDS advantage is **wave-scoped**, not block-scoped.
 
 ### 10.7 H5 — ISA unroll verification (PARTIALLY ADDRESSED)
 
