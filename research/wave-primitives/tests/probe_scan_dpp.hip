@@ -13,6 +13,8 @@
 template <typename T> __global__ void k_sum(T* o){ T v=(T)1;           o[threadIdx.x]=wave::dpp::scan_inclusive_sum(v); }
 template <typename T> __global__ void k_max(T* o){ T v=(T)threadIdx.x; o[threadIdx.x]=wave::dpp::scan_inclusive_max(v); }
 template <typename T> __global__ void k_min(T* o){ T v=(T)threadIdx.x; o[threadIdx.x]=wave::dpp::scan_inclusive_min(v); }
+// exclusive_sum: input lane=1 → lane i must = i (i.e. the inclusive of the predecessor).
+template <typename T> __global__ void k_excl(T* o){ T v=(T)1; o[threadIdx.x]=wave::dpp::scan_exclusive_sum(v); }
 
 template <typename T>
 int check(const char* tn) {
@@ -27,7 +29,11 @@ int check(const char* tn) {
     hipLaunchKernelGGL(k_min<T>,dim3(1),dim3(64),0,0,d); hipDeviceSynchronize();
     hipMemcpy(h,d,64*sizeof(T),hipMemcpyDeviceToHost);
     for(int i=0;i<64;i++) if((double)h[i]!=0.0){printf("  %s min FAIL lane %d got %.1f exp 0\n",tn,i,(double)h[i]);fails++;break;}
-    if(fails==0) printf("  %s sum/max/min ALL PASS\n",tn);
+    // exclusive_sum: all-1s input → lane i should hold i (prefix of i ones before it).
+    hipLaunchKernelGGL(k_excl<T>,dim3(1),dim3(64),0,0,d); hipDeviceSynchronize();
+    hipMemcpy(h,d,64*sizeof(T),hipMemcpyDeviceToHost);
+    for(int i=0;i<64;i++) if((double)h[i]!=(double)i){printf("  %s excl FAIL lane %d got %.1f exp %d\n",tn,i,(double)h[i],i);fails++;break;}
+    if(fails==0) printf("  %s sum/max/min/excl ALL PASS\n",tn);
     hipFree(d); return fails;
 }
 

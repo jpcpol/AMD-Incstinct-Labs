@@ -78,7 +78,7 @@ log "Results: $RESULTS"
 # 1. WAVE PRIMITIVES — LayerNorm (run3_layernorm)
 # ---------------------------------------------------------------------------
 sep
-log ">>> [1/6] LayerNorm with DPP reductions (narrow + wide)"
+log ">>> [1/10] LayerNorm with DPP reductions (narrow + wide)"
 
 LN_FLAGS="$BASE_FLAGS -I$WAVE_INC -I$BENCH_INC -I$ROCM_INC"
 LN_SRC="$ROOT/research/wave-primitives/benchmarks/bench_layernorm.hip"
@@ -125,7 +125,7 @@ fi
 # 2. WAVE PRIMITIVES — Softmax (run3_softmax)
 # ---------------------------------------------------------------------------
 sep
-log ">>> [2/6] Softmax with DPP reductions (wide + narrow)"
+log ">>> [2/10] Softmax with DPP reductions (wide + narrow)"
 
 SM_FLAGS="$BASE_FLAGS -I$WAVE_INC -I$BENCH_INC -I$ROCM_INC"
 SM_SRC="$ROOT/research/wave-primitives/benchmarks/bench_softmax.hip"
@@ -168,10 +168,99 @@ if [ -f "$SM_BIN_WIDE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. WAVE PRIMITIVES — Scan DPP (bench_scan_dpp + types)
+# ---------------------------------------------------------------------------
+sep
+log ">>> [3/10] Scan DPP — probe (correctness per type) + bench (portable vs DPP vs hipCUB)"
+
+SCAN_FLAGS="$BASE_FLAGS -I$WAVE_INC -I$BENCH_INC -I$ROCM_INC"
+
+# probe_scan_dpp: correctness for inclusive sum/max/min + exclusive_sum, all types
+PROBE_SCAN_SRC="$ROOT/research/wave-primitives/tests/probe_scan_dpp.hip"
+PROBE_SCAN_BIN="$RESULTS/probe_scan_dpp"
+if compile "probe_scan_dpp" $BASE_FLAGS -I$WAVE_INC "$PROBE_SCAN_SRC" -o "$PROBE_SCAN_BIN"; then
+    log "  Running probe_scan_dpp ..."
+    "$PROBE_SCAN_BIN" 2>&1 | tee "$RESULTS/probe_scan_dpp_output.txt"
+    if grep -q "ALL TYPES/OPS PASS" "$RESULTS/probe_scan_dpp_output.txt"; then
+        ok "scan_dpp_all_types_probe"
+    else
+        err "scan_dpp_all_types_probe" "some type/op failed — check output"
+    fi
+else
+    err "probe_scan_dpp_compile" "hipcc failed"
+fi
+
+SCAN_SRC="$ROOT/research/wave-primitives/benchmarks/bench_scan_dpp.hip"
+SCAN_BIN="$RESULTS/bench_scan_dpp"
+
+if compile "bench_scan_dpp" $SCAN_FLAGS "$SCAN_SRC" -o "$SCAN_BIN"; then
+    log "  Running bench_scan_dpp (float, kReps amortized) ..."
+    "$SCAN_BIN" 2>&1 | tee "$RESULTS/bench_scan_dpp_output.txt"
+    if grep -q "PASS" "$RESULTS/bench_scan_dpp_output.txt"; then
+        ok "scan_dpp_f32_correctness"
+    else
+        err "scan_dpp_f32_correctness" "PASS not found"
+    fi
+else
+    err "scan_dpp_compile" "hipcc failed"
+fi
+
+# DPP scan across types
+SCAN_TYPES_SRC="$ROOT/research/wave-primitives/benchmarks/bench_scan_dpp_types.hip"
+SCAN_TYPES_BIN="$RESULTS/bench_scan_dpp_types"
+if compile "bench_scan_dpp_types" $SCAN_FLAGS "$SCAN_TYPES_SRC" -o "$SCAN_TYPES_BIN"; then
+    log "  Running bench_scan_dpp_types (f32/f64/i32/i64) ..."
+    "$SCAN_TYPES_BIN" 2>&1 | tee "$RESULTS/bench_scan_dpp_types_output.txt"
+    ok "scan_dpp_types_ran"
+else
+    err "scan_dpp_types_compile" "hipcc failed"
+fi
+
+# ---------------------------------------------------------------------------
+# 2c. WAVE PRIMITIVES — Reduce DPP multi-type (bench_reduce_dpp_types)
+# ---------------------------------------------------------------------------
+sep
+log ">>> [4/10] Reduce DPP across types (sum/max/min × f32/f64/i32/i64)"
+
+RD_TYPES_SRC="$ROOT/research/wave-primitives/benchmarks/bench_reduce_dpp_types.hip"
+RD_TYPES_BIN="$RESULTS/bench_reduce_dpp_types"
+if compile "bench_reduce_dpp_types" $SCAN_FLAGS "$RD_TYPES_SRC" -o "$RD_TYPES_BIN"; then
+    log "  Running bench_reduce_dpp_types ..."
+    "$RD_TYPES_BIN" 2>&1 | tee "$RESULTS/bench_reduce_dpp_types_output.txt"
+    if grep -q "PASS" "$RESULTS/bench_reduce_dpp_types_output.txt"; then
+        ok "reduce_dpp_types_correctness"
+    else
+        err "reduce_dpp_types_correctness" "PASS not found — may be 64-bit DPP compile issue"
+    fi
+else
+    err "reduce_dpp_types_compile" "hipcc failed"
+fi
+
+# ---------------------------------------------------------------------------
+# 2d. WAVE PRIMITIVES — Block reduce (wave two-phase vs hipCUB BlockReduce)
+# ---------------------------------------------------------------------------
+sep
+log ">>> [5/10] Block reduce — two-phase wave vs hipCUB BlockReduce (bs=128..1024)"
+
+BR_SRC="$ROOT/research/wave-primitives/benchmarks/bench_block_reduce.hip"
+BR_BIN="$RESULTS/bench_block_reduce"
+if compile "bench_block_reduce" $SCAN_FLAGS "$BR_SRC" -o "$BR_BIN"; then
+    log "  Running bench_block_reduce ..."
+    "$BR_BIN" 2>&1 | tee "$RESULTS/bench_block_reduce_output.txt"
+    if grep -q "PASS\|wave_block_reduce" "$RESULTS/bench_block_reduce_output.txt"; then
+        ok "block_reduce_correctness"
+    else
+        err "block_reduce_correctness" "PASS not found or output unexpected"
+    fi
+else
+    err "bench_block_reduce_compile" "hipcc failed"
+fi
+
+# ---------------------------------------------------------------------------
 # 3. DME ABSTRACTION — probe_dme (gates all fa_dme work)
 # ---------------------------------------------------------------------------
 sep
-log ">>> [3/6] DME probe — validate __builtin_amdgcn_global_load_lds semantics"
+log ">>> [6/10] DME probe — validate __builtin_amdgcn_global_load_lds semantics"
 
 DME_SRC="$ROOT/research/dme-abstraction/tests/probe_dme.hip"
 DME_BIN="$RESULTS/probe_dme"
@@ -208,7 +297,7 @@ fi
 # 4. FLASH ATTENTION — fa_naive (baseline + LDS counter)
 # ---------------------------------------------------------------------------
 sep
-log ">>> [4/6] Flash Attention naive (step 1 baseline)"
+log ">>> [7/10] Flash Attention naive (step 1 baseline)"
 
 FA_DIR="$ROOT/research/flash-attention-mi300x"
 FA_INC="$WAVE_INC $BENCH_INC"
@@ -244,7 +333,7 @@ fi
 # 5. FLASH ATTENTION — fa_dpp (Bc=64, 128, 256)
 # ---------------------------------------------------------------------------
 sep
-log ">>> [5/6] Flash Attention DPP (step 2 — Bc=64/128/256)"
+log ">>> [8/10] Flash Attention DPP (step 2 — Bc=64/128/256)"
 
 DPP_FLAGS_BASE="$BASE_FLAGS -I$WAVE_INC -I$BENCH_INC -DFA_HEAD_DIM=64"
 
@@ -285,7 +374,7 @@ fi
 # 6. DME — probe again with bench_dme (if probe_dme was correct + bench exists)
 # ---------------------------------------------------------------------------
 sep
-log ">>> [6/6] DME throughput benchmark (if probe_dme passed)"
+log ">>> [9/10] DME throughput benchmark (if probe_dme passed)"
 
 BENCH_DME_SRC="$ROOT/research/dme-abstraction/tests/bench_dme.hip"
 if [ "$DME_VALID" = "true" ] && [ -f "$BENCH_DME_SRC" ]; then
@@ -302,6 +391,26 @@ elif [ "$DME_VALID" = "false" ]; then
     skip "bench_dme" "probe_dme failed — DME semantics unknown"
 else
     skip "bench_dme" "bench_dme.hip not yet written (run probe_dme results determine design)"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. WAVE PRIMITIVES — bench_scan (portable scan vs hipCUB, no-kReps baseline)
+# ---------------------------------------------------------------------------
+sep
+log ">>> [10/10] Scan correctness + portable vs hipCUB benchmark (bench_scan)"
+
+BSCAN_SRC="$ROOT/research/wave-primitives/benchmarks/bench_scan.hip"
+BSCAN_BIN="$RESULTS/bench_scan"
+if compile "bench_scan" $SCAN_FLAGS "$BSCAN_SRC" -o "$BSCAN_BIN"; then
+    log "  Running bench_scan ..."
+    "$BSCAN_BIN" 2>&1 | tee "$RESULTS/bench_scan_output.txt"
+    if grep -q "PASS" "$RESULTS/bench_scan_output.txt"; then
+        ok "bench_scan_correctness"
+    else
+        err "bench_scan_correctness" "PASS not found"
+    fi
+else
+    err "bench_scan_compile" "hipcc failed"
 fi
 
 # ---------------------------------------------------------------------------

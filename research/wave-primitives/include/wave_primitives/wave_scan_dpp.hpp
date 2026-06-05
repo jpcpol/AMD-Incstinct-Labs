@@ -73,9 +73,17 @@ template <typename T> __device__ __forceinline__ T scan_inclusive_min(T v) { ret
 
 template <typename T>
 __device__ __forceinline__ T scan_exclusive_sum(T v) {
+    // Full-DPP exclusive scan: no shfl_up, no bpermute.
+    // lane L needs inc[L-1] (or 0 if L==0).
+    // row_shr1 on inc gives inc[L-1] within each 16-lane row, but resets to identity=0
+    // at the start of each new row (lanes 16, 32, 48). Fix those with row_bcast15 of inc,
+    // which broadcasts inc[15]→lanes16..31, inc[31]→32..47, inc[47]→48..63.
     T inc = scan_inclusive_sum(v);
-    T ex  = __shfl_up(inc, 1, 64);
-    return (scan_lane_id() == 0) ? T(0) : ex;
+    T ex    = __builtin_amdgcn_update_dpp(T(0), inc, 0x111, 0xf, 0xf, false);  // row_shr1
+    T carry = __builtin_amdgcn_update_dpp(T(0), inc, 0x142, 0xf, 0xf, false);  // row_bcast15
+    const unsigned L = scan_lane_id();
+    if ((L & 15u) == 0u && L != 0u) ex = carry;  // patch lanes 16, 32, 48
+    return ex;
 }
 
 #else  // wave32 / NVIDIA fallback — portable Hillis-Steele.
