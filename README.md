@@ -42,6 +42,10 @@ reduction (1.79× vs hipCUB) and scan (~parity, 1.028×), making this look
 architectural rather than algorithm-specific.
 
 Generalized across **float/double/int32/int64 × sum/max/min** — 12/12 correctness PASS.
+For low-precision types, **float32 accumulation is the correct default — and faster**:
+`__half` fp32-acc is 10% faster than native fp16, and `bf16` fp32-acc is 62% faster
+than native bf16 (the bf16 path round-trips through float per step on gfx942). Both
+win on speed *and* accuracy — not a tradeoff.
 
 **Caveats:** virtualized MI300X, clocks unpinned, single hardware point (no MI250/RDNA3).
 Stated as a bounded claim, not a general "we beat hipCUB" assertion. The microbenchmark
@@ -70,7 +74,10 @@ rocprofv3 attributes −8.6% LDS to DPP and **−44.7% VMEM reads** to DME overl
 Reported honestly with the negative results:
 
 - **MFMA does not help at head dim 64** (Step 4 is 0.95× vs Step 3): the 16×16×16
-  tiles are too small to saturate the matrix cores. MFMA needs large D + head-batching.
+  tiles are too small to saturate the matrix cores. But a head-dim sweep confirms
+  the cause — at **D=128 the MFMA kernel reaches 10.45 TFLOPS vs 6.19 at D=64
+  (+69%)**: the matrix cores scale strongly once the tiles are large enough. MFMA's
+  weakness was small heads, not MFMA itself.
 - **A Bc tile-size sweep refutes** the "freeing LDS enables bigger tiles" hypothesis:
   Bc=64 (= wave size) is optimal; Bc=96 fits in LDS but is slower (lane↔key mapping cost).
 - **Welford one-pass LayerNorm is slower** than two-pass DPP (residual `__shfl` LDS +

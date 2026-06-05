@@ -474,22 +474,26 @@ CDNA3 wave64*. Whether an op can reach zero LDS is the deciding factor.
 
 `bench_h3_fp16acc.hip`, kReps=4096 amortized, 1024 blocks × wave_size, MI300X VF:
 
-| Strategy | Median (µs) | Throughput |
+| Strategy | Median (µs) | fp32-acc vs native |
 | --- | --- | --- |
-| `wave::reduce_sum` __half (fp32 acc) | 933.9 | 0.070 Ge/s |
-| Naive fp16 reduce (`__hadd`) | 1038.7 | 0.063 Ge/s |
+| `__half` fp32 acc | 933.9 | — |
+| `__half` naive (`__hadd`) | 1038.7 | **−10.1% (fp32-acc faster)** |
+| `bf16` fp32 acc | 1123.0 | — |
+| `bf16` naive | 2936.0 | **−61.7% (fp32-acc faster)** |
 
-**Overhead: −10.1% (fp32-acc is FASTER, not slower).**
+(`bench_h3_fp16acc.hip` for `__half`, `bench_bf16acc.hip` for `bf16`; both
+kReps=4096, 1024 blocks × wave_size, MI300X VF.)
 
-Outcome: **CONFIRMED and exceeded.** H3 predicted < 10% overhead (falsification
-at > 15%). The measured result is not just within bound — fp32 accumulation is
-*faster* than native fp16. On CDNA3, `v_add_f32` is cheaper than the `__hadd`
-fp16 scalar path (which requires pack/unpack on gfx942), and the cross-lane
-`shfl` cost is identical for both. Promoting __half → float32 for the
-accumulation is therefore strictly better: lower latency AND higher accuracy
-(no fp16 rounding per step, no overflow risk on long sums). Accuracy at the
-launch-bound regime was already identical (error 0.0016 each on 64×0.1f);
-the kReps-amortized latency now shows fp32-acc wins on speed too.
+Outcome: **CONFIRMED and exceeded, for both half types.** H3 predicted < 10%
+overhead (falsification at > 15%). The measured result is not just within bound —
+fp32 accumulation is *faster* than native low-precision reduce, decisively so for
+bf16. On CDNA3, `v_add_f32` is cheaper than the `__hadd` fp16 path (pack/unpack on
+gfx942), and bf16 has no native add at all — the naive bf16 path round-trips through
+float on every step, which is why its overhead balloons to −61.7%. The cross-lane
+`shfl` cost is identical across types. Promoting half → float32 for the accumulation
+is therefore strictly better: lower latency AND higher accuracy (no per-step rounding,
+no overflow on long sums). This is the library's default for both half types and is
+a win on both axes, not a tradeoff.
 
 > Note: the earlier launch-bound pass (`bench_all_types`, ~5.7 µs floor) showed
 > all variants indistinguishable. The amortized re-run was required to surface

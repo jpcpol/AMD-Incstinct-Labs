@@ -375,6 +375,24 @@ for max (`-inf`) requires `std::numeric_limits<float>::lowest()`, which cannot
 be folded as cleanly as `0` for sum — a microarchitectural scheduling difference.
 For int32, all three operations are identical in cost, as expected.
 
+**Low-precision accumulation (`__half`, `bf16`).** For half-precision reductions
+the library promotes each element to float32 before reducing. We measured the cost
+of this against a native-precision reduction (kReps=4096 amortized,
+`bench_h3_fp16acc.hip` / `bench_bf16acc.hip`):
+
+| Type | fp32-acc (µs) | native (µs) | fp32-acc vs native |
+| --- | --- | --- | --- |
+| `__half` | 933.9 | 1038.7 | **−10.1% (faster)** |
+| `bf16` | 1123.0 | 2936.0 | **−61.7% (faster)** |
+
+float32 accumulation is *faster* than native low-precision reduction on CDNA3, not
+slower — decisively so for bf16. The native paths pay a per-step conversion: `__hadd`
+requires pack/unpack on gfx942, and bf16 has no native add at all (it round-trips
+through float every step). Promoting once and reducing in float32 is therefore
+strictly better — lower latency *and* higher accuracy (no per-step rounding, no
+overflow on long sums). This is the library's default for both half types and is
+not a precision/speed tradeoff but a win on both axes.
+
 #### Block-level reduce (two-phase: wave DPP → LDS → wave DPP)
 
 For block sizes exceeding one wave (128–1024 threads), the block reduce requires
@@ -550,6 +568,20 @@ The lesson: **MFMA is not an automatic win for attention with small heads (D=64)
 its advantage requires large D and head-batching to fill the matrix cores.** For
 small-head FA on CDNA3, the DPP + DME dot-product path (Step 3) remains fastest.
 
+A head-dimension sweep (`fa_mfma_dsweep.hip`) confirms this is a tile-size effect,
+not an MFMA limitation:
+
+| Head dim | nD (MFMA tiles / KV iter) | Median (µs) | TFLOPS |
+| --- | --- | --- | --- |
+| D = 64 | 4 | 86.7 | 6.19 |
+| D = 128 | 8 | 102.7 | **10.45** |
+
+Doubling the head dimension lifts achieved throughput by **+69%** (6.19 → 10.45
+TFLOPS): with nD = 8 the matrix cores receive enough work per iteration to amortize
+the fixed softmax/staging cost. The negative result at D=64 is therefore a
+small-head regime, not a verdict on MFMA — at production head dimensions (128, 256)
+the matrix-core path is expected to dominate.
+
 ##### Verified MFMA wave64 lane mapping (reusable artifact)
 
 The first MFMA attempt failed correctness because the register-to-matrix lane
@@ -658,9 +690,8 @@ Repository: [github.com/jpcpol/AMD-Incstinct-Labs](https://github.com/jpcpol/AMD
 4. **hipCUB version.** Pinned to hipCUB 4.2.0. Future versions could change the
    WarpReduce implementation.
 
-5. **Type coverage.** fp16 measured (H3: fp32-accumulation is 10% faster than
-   native fp16 reduce on CDNA3); bf16 accuracy/latency parity assumed but not
-   separately amortized.
+5. **Type coverage.** Both half types measured (§5.5): fp32-accumulation is faster
+   than native low-precision reduce on CDNA3 — 10% for `__half`, 62% for `bf16`.
 
 ---
 
