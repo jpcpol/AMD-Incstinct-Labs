@@ -289,28 +289,35 @@ int main(){
     run_cfg<128>({0,256,256,2,2,1,1}, "MHA  causal seq256 h2",  true);   // causal path
     run_cfg<128>({0,256,256,4,2,1,1}, "GQA  causal seq256 4q2kv",true);  // GQA+causal
 
-    // === Performance at LLM-realistic scale (timing only) ===
-    // The seqLen sweep doubles as the CAL-L4 "flat-context attention cost" baseline:
-    // it measures how the O(n²) attention cost scales with sequence length n — the
-    // curve the L4 Efficiency Hypothesis claims to beat. See Conexion_CAL-L4_fa-dme.md.
-    printf("\n--- seqLen sweep (D=128, MHA, full) — also CAL-L4 flat-context baseline ---\n");
-    const int seqs[4] = {512, 1024, 2048, 4096};
-    float lat[4];
-    lat[0] = run_cfg<128>({0,512, 512, 8,8,1,0}, "MHA full seq512",  false);
-    lat[1] = run_cfg<128>({0,1024,1024,8,8,1,0}, "MHA full seq1k",   false);
-    lat[2] = run_cfg<128>({0,2048,2048,8,8,1,0}, "MHA full seq2k",   false);
-    lat[3] = run_cfg<128>({0,4096,4096,8,8,1,0}, "MHA full seq4k",   false);
+    // === CAL-L4 flat-context O(n²) baseline (Rol 1) ===
+    // 7-point seqLen sweep matching the L4 paper §5.2 protocol. Measures how the
+    // flat-context attention cost scales with n — the curve the L4 Efficiency
+    // Hypothesis claims to beat. Log-log fit → exponent (accept ∈ [1.8, 2.2]).
+    // All seqLens are multiples of Br=16 and Bc=64. See cal-l4 paper §5.2.
+    printf("\n--- CAL-L4 baseline: flat-context O(n²) sweep (D=128, MHA, full) ---\n");
+    const int seqs[7] = {512, 768, 1024, 1536, 2048, 3072, 4096};
+    float lat[7];
+    for (int i = 0; i < 7; ++i) {
+        char lbl[32]; snprintf(lbl, sizeof(lbl), "MHA full seq%d", seqs[i]);
+        lat[i] = run_cfg<128>({0, seqs[i], seqs[i], 8, 8, 1, 0}, lbl, false);
+    }
 
-    // Log-log fit of latency vs seqLen → exponent p (cost ~ n^p). p≈2 confirms O(n²).
-    // Least-squares slope of log(lat) vs log(seq).
+    // Log-log least-squares fit: cost ~ n^p. p≈2 confirms O(n²).
     {
-        double sx=0,sy=0,sxx=0,sxy=0; int N=4;
+        double sx=0,sy=0,sxx=0,sxy=0; int N=7;
         for(int i=0;i<N;++i){ double x=log((double)seqs[i]), y=log((double)lat[i]);
             sx+=x; sy+=y; sxx+=x*x; sxy+=x*y; }
         double p=(N*sxy - sx*sy)/(N*sxx - sx*sx);
-        printf("\n  CAL-L4 baseline: attention cost scales as n^%.2f (p≈2.0 confirms O(n²))\n", p);
-        printf("  seq 512→4k latency: %.1f → %.1f µs (%.1f× over 8× seqLen)\n",
-               lat[0], lat[3], lat[3]/lat[0]);
+        // R² of the fit (how cleanly quadratic)
+        double my=sy/N, sstot=0, ssres=0, b=(sy-p*sx)/N;
+        for(int i=0;i<N;++i){ double x=log((double)seqs[i]), y=log((double)lat[i]);
+            double yh=p*x+b; ssres+=(y-yh)*(y-yh); sstot+=(y-my)*(y-my); }
+        double r2 = 1.0 - ssres/sstot;
+        printf("\n  === CAL-L4 BASELINE RESULT ===\n");
+        printf("  attention cost scales as n^%.2f  (R²=%.4f)\n", p, r2);
+        printf("  accept window [1.8, 2.2]: %s\n", (p>=1.8&&p<=2.2)?"CONFIRMED O(n²)":"OUTSIDE — investigate");
+        printf("  seq 512→4k: %.1f → %.1f µs (%.1f× over 8× seqLen)\n",
+               lat[0], lat[6], lat[6]/lat[0]);
     }
 
     printf("\n--- GQA (32 q / 8 kv, Llama-3 style), D=128 ---\n");
