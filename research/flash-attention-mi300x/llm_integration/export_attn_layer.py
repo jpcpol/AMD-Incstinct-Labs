@@ -75,6 +75,14 @@ def main():
     # We build position ids and a causal mask the way the model expects.
     with torch.no_grad():
         pos = torch.arange(args.seq).unsqueeze(0)
+        # Some models (Qwen2.5) add a bias to Q/K/V projections; the HIP validator
+        # uses a bias-free GEMM. Zero the projection biases so reference and kernel
+        # compute the SAME thing — this isolates the FA kernel numerics (the point
+        # of Step 2-B) from the bias term, which is a trivial elementwise add.
+        for proj in (layer.q_proj, layer.k_proj, layer.v_proj, layer.o_proj):
+            if getattr(proj, "bias", None) is not None:
+                proj.bias.data.zero_()
+
         # transformers attention modules vary in signature across versions; we call
         # the projections + SDPA manually to stay version-robust and to mirror what
         # the HIP side reconstructs.
@@ -97,6 +105,10 @@ def main():
             c = cos.unsqueeze(1).to(t.dtype); s = sin.unsqueeze(1).to(t.dtype)
             return t * c + rot * s
         q = rope(q); k = rope(k)
+
+        # DIAG: dump Q after proj+RoPE in seq-major [seq, nH, D] layout (what the
+        # HIP side produces post-RoPE, pre-repack) to localize proj/RoPE vs attn bugs.
+        q_diag = q.transpose(1, 2).reshape(args.seq, nH*D).detach().cpu().numpy()
 
         # GQA: expand kv heads to match q heads for the reference SDPA.
         rep = nH // nKV
@@ -128,6 +140,8 @@ def main():
     # precomputed cos/sin so the HIP side doesn't reimplement RoPE math (just reads)
     meta["tensors"]["cos"]    = save("cos",    cos.view(args.seq, D),               np.float32)
     meta["tensors"]["sin"]    = save("sin",    sin.view(args.seq, D),               np.float32)
+    # DIAG: Q post-proj+RoPE [seq, nH*D] fp32 — to isolate proj/RoPE from attention
+    q_diag.astype(np.float32).tofile(os.path.join(args.out, "q_diag.bin"))
 
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

@@ -220,6 +220,22 @@ int run(const std::string& dir, int seq, int H, int nH, int nKV){
     hipLaunchKernelGGL(rope_kernel,dim3((seq*nKV*D+thr-1)/thr),dim3(thr),0,0,dK,dCos,dSin,seq,nKV,D);
     hipDeviceSynchronize();
 
+    // DIAG: compare Q post-proj+RoPE (seq-major [seq,nH*D]) vs q_diag.bin from export.
+    // Localizes proj/RoPE bug vs attention/repack bug.
+    {
+        std::string qd = dir+"/q_diag.bin";
+        FILE* f=fopen(qd.c_str(),"rb");
+        if(f){
+            std::vector<float> qref((size_t)seq*nH*D); fread(qref.data(),4,qref.size(),f); fclose(f);
+            std::vector<__half> qgpu((size_t)seq*nH*D); hipMemcpy(qgpu.data(),dQ,qgpu.size()*2,hipMemcpyDeviceToHost);
+            float me=0,mr=0;
+            for(size_t i=0;i<qref.size();++i){ float g=__half2float(qgpu[i]),r=qref[i];
+                float e=fabsf(g-r); me=std::max(me,e); mr=std::max(mr,e/(fabsf(r)+1e-3f)); }
+            printf("  [DIAG] Q post-proj+RoPE: max|gpu-ref|=%.4f rel=%.4f %s\n",
+                   me, mr, mr<0.05f?"proj/RoPE OK -> bug in attn/repack":"BUG in proj/RoPE");
+        }
+    }
+
     // Repack Q [seq,nH,D] -> [nH,seq,D] (head-major) for the FA kernel; same for K/V.
     // Do it on host for simplicity (B is correctness, not speed).
     auto repack=[&](__half* dsrc,int heads)->__half*{
