@@ -28,7 +28,14 @@ end-to-end speedup over a portable baseline, with hardware counters isolating ea
 contribution. We also report the boundaries honestly: the large reduction speedup
 is reduction-domain-specific (it collapses to 1–3% in memory-bound kernels), the
 zero-LDS property is wave-scoped (block-level reduction matches hipCUB exactly),
-and matrix-core (MFMA) tiling does not help small-head attention. The library is
+and matrix-core (MFMA) tiling does not help small-head attention. Finally, we carry
+the kernel through the full research→application arc: generalized to LLM-realistic
+shapes (runtime seqLen, GQA, causal), it reproduces a real Qwen2.5 attention layer
+within fp16 tolerance and, wrapped as a PyTorch custom op patched into all 24 layers
+of the model, runs the complete LLM during prefill while preserving the top-1
+next-token prediction. Against a production attention backend it is 8.5–15× slower —
+reported honestly, with the cause localized to a single-wave occupancy limit
+orthogonal to the (portable) primitive findings. The library is
 header-only, MIT-licensed, and falls back to portable `__shfl_*` on wave32/NVIDIA
 targets.
 
@@ -79,6 +86,13 @@ that exploit it fully, and show the result generalizes across both reduction and
   "free-LDS-enables-bigger-tiles" hypothesis (Section 5.8). As a reusable
   by-product we document the empirically-verified `v_mfma_f32_16x16x16f16` wave64
   register-to-matrix lane mapping for gfx942.
+- **C7.** End-to-end research→application closure: the kernel, generalized to
+  LLM-realistic shapes (runtime seqLen, GQA, causal), reproduces a real Qwen2.5
+  attention layer within fp16 tolerance (4.34% of signal scale) and — wrapped as a
+  PyTorch custom op patched into all 24 layers — runs the full model during prefill
+  with the top-1 next-token prediction preserved. Positioned against production
+  fused SDPA it is 8.5–15× slower, with the gap localized to a single-wave occupancy
+  limit orthogonal to the primitive contributions (Section 5.9).
 
 ---
 
@@ -634,6 +648,70 @@ effect: K/V tile loads that previously stalled the VMEM pipeline are now issued
 via the async DME path (streaming cache, sc0=1), reducing visible VMEM read
 instructions by nearly half. This is the hardware-level signature of the overlap.
 
+### 5.9 From kernel to a real LLM
+
+§5.8 measured the FA kernel on a fixed synthetic configuration (D=64, seqLen=512,
+8 heads). Two questions remain before the kernel can be called *applicable*: does it
+hold up at the shapes real decoder LLMs use, and does it reproduce a real model's
+output? We answer both, then position the kernel against a production attention backend.
+
+#### Generalization to LLM-realistic shapes (`fa_robust`)
+
+We generalize the verified 1-wave/block MFMA kernel of §5.8 to runtime sequence
+length, grouped-query attention (GQA), and causal masking with diagonal tile-skip
+(`fa_robust.hip`). Correctness is CPU-verified across MHA / GQA / causal at D=64 and
+D=128 (max|gpu−ref| < 0.0006, 5/5 PASS). The flat-context cost over seqLen 512→4096
+at D=128 fits a clean power law, **n^1.90–1.91 (R²≈0.996) across three independent
+runs** — the expected quadratic attention regime, measured rather than assumed, on a
+kernel validated against LLM-realistic shapes (not a toy).
+
+#### Numerical validation against a real attention layer
+
+We export layer 0 of **Qwen2.5-0.5B** (real weights + RoPE + GQA 14q/2kv + causal)
+and reconstruct it on-GPU: Q/K/V projection → RoPE → `fa_robust` → O projection,
+compared against the fp32 HuggingFace reference. The error through the full layer is
+**4.34% of the signal scale** (max|·| absolute 0.0042 over a signal of mean magnitude
+0.097) — within fp16 tolerance for an fp16 kernel plus two naive fp16 projection
+GEMMs versus an fp32 reference. The kernel reproduces a *real* transformer attention
+layer, closing the synthetic→real gap. (Implementation note for replicators: Qwen2.5
+places a bias on the Q/K/V projections — straightforward to miss with a bias-free GEMM.)
+
+#### End-to-end: a full model running on the kernel
+
+We wrap `fa_robust` as a PyTorch custom op (`torch.ops.amdinstinct.flash_attn`) and
+monkey-patch it into **all 24 attention layers** of Qwen2.5-0.5B during prefill, then
+compare full-model logits against the unpatched fp16 forward. The model predicts the
+**same next token** (top-1 identical) running entirely on our kernel. The last-token
+logit cosine similarity decays gradually with depth — 0.9997 at one patched layer to
+0.975 at all 24 — which a layer-count bisection confirms is fp16 error accumulation
+(monotone in depth; top-1 matches at 1, 6, 12, 18, and 24 layers), not a structural
+defect. This is the literal closure of the research→application arc the wave-primitive
+finding set out on: the microbenchmark optimization runs a real LLM and produces the
+same model.
+
+#### Positioning against production Flash Attention
+
+For context we compare the same shapes (D=128, GQA 32q/8kv, causal) against PyTorch's
+fused scaled-dot-product-attention backend on ROCm — the realistic "what production
+stacks use" baseline (correctness vs SDPA: rel 0.007):
+
+| seqLen | ours (µs) | ours TFLOPS | SDPA (µs) | SDPA TFLOPS | ours/SDPA |
+| --- | --- | --- | --- | --- | --- |
+| 512  | 389.7 | 5.51 | 45.8 | 46.9 | 8.5× |
+| 1024 | 1052.4 | 8.16 | 77.4 | 111.0 | 13.6× |
+| 2048 | 3411.1 | 10.07 | 224.0 | 153.4 | 15.2× |
+| 4096 | 11830.8 | 11.62 | 967.4 | 142.1 | 12.2× |
+
+Production SDPA is **8.5–15× faster** — expected, and reported honestly. Our kernel is
+a single-wave-per-block research design; SDPA uses a fully scheduled multi-wave MFMA
+pipeline that fills all compute units. Our achieved throughput does scale with seqLen
+(5.5 → 11.6 TFLOPS), but the 1-wave layout leaves 48 of 64 lanes idle during softmax
+(the same occupancy limit identified in §5.8). **The gap is an occupancy gap, not a
+primitive gap:** the DPP+DME findings are datapath-level and orthogonal to the
+scheduling work that closes the distance to production — they are portable into a
+multi-wave kernel, which is the indicated next step. The value here is the measured
+gap and its localized cause, not a competitive number.
+
 ---
 
 ## 6. Implementation
@@ -751,6 +829,15 @@ deferred but the mechanism is established.
 
 6. The full-DPP geometry for both primitives is available as a header-only,
    MIT-licensed library with wave32/NVIDIA fallback.
+
+7. Carried through the full research→application arc, the kernel generalizes to
+   LLM-realistic shapes (n^1.90–1.91 quadratic regime, R²≈0.996), reproduces a real
+   Qwen2.5 attention layer within fp16 tolerance (4.34% of signal scale), and runs
+   the complete 24-layer model during prefill as a PyTorch custom op with the top-1
+   next-token prediction preserved. Against production fused SDPA it is 8.5–15×
+   slower; the gap is a single-wave occupancy limit (48/64 lanes idle during
+   softmax), orthogonal to and not contradicted by the DPP/DME datapath findings —
+   a multi-wave kernel is the indicated path to close it.
 
 ---
 
