@@ -86,11 +86,12 @@ def main() -> None:
     # Try a few known layouts for the CAL/L4 handoff json. On the VM, pass --l4a.
     rel = ("CAL", "L4", "experiments", "efficiency_hypothesis", "results",
            "l4a_results.json")
-    candidates = [
-        Path(__file__).resolve().parents[5].joinpath(*rel),          # AMD repo sibling
-        Path(__file__).resolve().parents[6].joinpath(*rel),          # one level up
-        Path.home() / "Documents" / "Aural Syncro" / Path(*rel),     # workspace root
-    ]
+    here = Path(__file__).resolve()
+    candidates = [here.parent / "results" / "l4a_results.json"]  # VM: alongside the sweep
+    for up in (5, 6):  # local workspace layouts (guarded — short paths on the VM)
+        if len(here.parents) > up:
+            candidates.append(here.parents[up].joinpath(*rel))
+    candidates.append(Path.home() / "Documents" / "Aural Syncro" / Path(*rel))
     default_l4a = next((str(c) for c in candidates if c.exists()), str(candidates[0]))
     ap.add_argument("--l4a", default=default_l4a,
                     help="path to L4-A results json (the O(κ) side)")

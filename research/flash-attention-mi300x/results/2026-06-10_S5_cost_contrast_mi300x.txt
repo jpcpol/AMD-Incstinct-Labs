@@ -1,0 +1,89 @@
+================================================================================
+S5 — CAL-L4 cost contrast O(n²) flat-context vs O(κ) governance state
+MI300X VF (gfx942), ROCm 7.2, droplet 576688667, session 2026-06-10
+Pre-registered: PRE_REGISTRATION_S5_COST_CONTRAST.md
+================================================================================
+
+=== Confirmatory baseline re-run (C1): fa_robust seqLen sweep ===
+Device : AMD Instinct MI300X VF (gfx904)
+FA robustness sweep — LLM-realistic shapes (GQA + causal + seqLen)
+
+--- correctness (small configs, CPU-verified) ---
+  MHA  full  seq256 h2         D=64  err=0.00006 [PASS]  37.0 µs  0.91 TFLOPS
+  MHA  full  seq256 h2         D=128  err=0.00008 [PASS]  56.1 µs  1.20 TFLOPS
+  GQA  full  seq256 4q2kv      D=128  err=0.00005 [PASS]  56.1 µs  2.39 TFLOPS
+  MHA  causal seq256 h2        D=128  err=0.00046 [PASS]  56.0 µs  0.60 TFLOPS
+  GQA  causal seq256 4q2kv     D=128  err=0.00050 [PASS]  56.0 µs  1.20 TFLOPS
+
+--- CAL-L4 baseline: flat-context O(n²) sweep (D=128, MHA, full) ---
+  MHA full seq512              D=128  (timing only)    103.9 µs  10.34 TFLOPS
+  MHA full seq768              D=128  (timing only)    301.1 µs  8.02 TFLOPS
+  MHA full seq1024             D=128  (timing only)    457.4 µs  9.39 TFLOPS
+  MHA full seq1536             D=128  (timing only)    946.8 µs  10.21 TFLOPS
+  MHA full seq2048             D=128  (timing only)    1633.3 µs  10.52 TFLOPS
+  MHA full seq3072             D=128  (timing only)    3627.7 µs  10.66 TFLOPS
+  MHA full seq4096             D=128  (timing only)    5986.2 µs  11.48 TFLOPS
+
+  === CAL-L4 BASELINE RESULT ===
+  attention cost scales as n^1.90  (R²=0.9962)
+  accept window [1.8, 2.2]: CONFIRMED O(n²)
+  seq 512→4k: 103.9 → 5986.2 µs (57.6× over 8× seqLen)
+
+--- GQA (32 q / 8 kv, Llama-3 style), D=128 ---
+  GQA full seq2k               D=128  (timing only)    5513.7 µs  12.46 TFLOPS
+
+--- causal masking, D=128 ---
+  MHA causal seq2k             D=128  (timing only)    1048.6 µs  8.19 TFLOPS
+  GQA causal seq2k             D=128  (timing only)    3357.8 µs  10.23 TFLOPS
+
+Notes: causal TFLOPS uses 0.5x work estimate. err threshold 0.15 (fp16).
+Correctness verified on small configs (MHA/GQA/causal); large configs timing-only.
+
+=== S5 cost contrast (s5_cost_contrast.py, reads real l4a_results.json) ===
+============================================================================
+S5 — Cost contrast: O(n²) flat-context vs O(κ) governance state (MI300X)
+============================================================================
+
+[O(n²) side] flat-context attention law (R1, D=128, MFMA):
+  Cost_flat(n) = 8.0674e-04 · n^1.907   (R²=0.9967)
+  C1 (exponent ∈ [1.8,2.2]): PASS  (p=1.907)
+
+[O(κ) side] governance-state cost (L4-A dual volume):
+  source: results/l4a_results.json
+  κ(V_Tucker) = 1296   cost_reads ≈ 1322 (κ+|E|)   U(G_pruned) ≈ 0.862
+  → CONSTANT in n (depends on governance-state complexity, not artifacts)
+
+[Contrast] decoupling ratio D(n) = Cost_flat(n) / Cost_gov, normalized to n=512:
+  n=  512   D(n)=   1.00×   (flat≈   118.6µs, gov≈1322 reads, const)
+  n=  768   D(n)=   2.17×   (flat≈   256.9µs, gov≈1322 reads, const)
+  n= 1024   D(n)=   3.75×   (flat≈   444.8µs, gov≈1322 reads, const)
+  n= 1536   D(n)=   8.13×   (flat≈   963.8µs, gov≈1322 reads, const)
+  n= 2048   D(n)=  14.07×   (flat≈  1668.3µs, gov≈1322 reads, const)
+  n= 3072   D(n)=  30.49×   (flat≈  3615.1µs, gov≈1322 reads, const)
+  n= 4096   D(n)=  52.77×   (flat≈  6257.6µs, gov≈1322 reads, const)
+
+  C2 (D(n) increasing ∧ growth-exp ∈ [1.8,2.2]): PASS  (monotone=True, exp=1.907, R²=1.0000)
+
+  C3 (scope honesty) — STATED:
+    (i)  κ=1296 is at governance-corpus scale (n=30 sessions, 11 dims),
+         NOT seqLen scale. The two `n` are different objects.
+    (ii) This contrast shows the MECHANISM (cost coupling vs decoupling),
+         not a production-scale speedup.
+    (iii) κ does not reflect the Form-1 prune (κ is the Tucker core's;
+          the prune lives in G_pruned). Inherited from L4-A C4.
+
+============================================================================
+VERDICT: S5 demonstrates the L4 Efficiency Hypothesis MECHANISM on MI300X.
+  Flat-context cost grows ~n^1.91; governance-state cost is bounded by
+  κ(V) and decoupled from artifact volume n. Condition (b) met as a
+  mechanism result. → FREEZE.
+============================================================================
+
+=== §3.3 optional MFMA probe of the O(κ) side: OMITTED (per prereg) ===
+The read-count (κ+|E|≈1322, n-independent) is the correct cost object; the
+contrast point is decoupling, not an absolute κ-side latency. Writing a new
+MFMA kernel for a 1296-element core is a build cycle the prereg §3.3 gates
+against ("only if cheap, no new kernel build"). Reported as future work.
+
+=== VERDICT: C1 PASS (n^1.91, R²=0.9967) · C2 PASS (D(n)→52.8× @4k) · C3 PASS ===
+S5 demonstrates the L4 Efficiency Hypothesis MECHANISM on MI300X. FREEZE.
