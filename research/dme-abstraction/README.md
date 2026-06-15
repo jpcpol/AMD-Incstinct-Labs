@@ -22,7 +22,7 @@ The hardware signature of successful overlap: `SQ_INSTS_VMEM_RD` drops by 44.7% 
 | File | Purpose | Status |
 | ---- | ------- | ------ |
 | `include/dme/dme_copy.hpp` | 1D element + tile async copy API | **Validated** (MI300X, Run 4) |
-| `include/dme/tensor_prefetch.hpp` | 2D strided tile prefetch + AsyncTile2D manager | Written (pending hardware run) |
+| `include/dme/tensor_prefetch.hpp` | 2D tile prefetch + AsyncTile2D manager | **Validated** (MI300X, Run 5 — via fa_decode_dme_kernel 7/7 PASS) |
 | `tests/probe_dme.hip` | Empirical probe: offset, wait, collision semantics | **Validated** (Run 4) |
 | `tests/bench_dme.hip` | Throughput: DME vs raw VMEM load | **Validated** (Run 4) |
 | `tests/bench_dme_async.hip` | DME double-buffer overlap vs sync | **Validated** (Run 4, 1.02-1.04×) |
@@ -78,7 +78,7 @@ for (int j = 0; j < n_tiles; ++j) {
 
 **Flash Attention (validated):** `fa_dme.hip` uses the 1D API directly. It achieves 1.18× vs naive attention (82.4 µs vs 97.2 µs, CDNA3 MI300X) with 44.7% fewer VMEM reads (rocprofv3 counters).
 
-**cdna3 runtime (planned):** `tensor_prefetch.hpp` targets the KV-cache layout `[n_heads, max_seq, D]` used in `cdna3::runtime::Session`. The `prefetch_tile2d_strided_fp16` variant handles non-contiguous cache rows (stride_row = max_seq).
+**cdna3 runtime (integrated):** `fa_decode_dme_kernel` uses `tensor_prefetch.hpp` to read the KV-cache `[n_heads, max_seq, D]` directly without `pack_kv_kernel`. Within a single head, key positions are contiguous (stride = D = kCols), so `prefetch_tile2d_fp16` (packed) is used — not the strided variant. stride_kv=max_seq is only the head-to-head pointer offset.
 
 ## Gap Reference
 
