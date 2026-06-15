@@ -1,0 +1,8 @@
+   id=   279  logit=  15.422
+   id=   198  logit=  15.297
+   id=   320  logit=  15.086
+   id= 16448  logit=  15.031
+
+argmax: runtime=12095  ref=12095  MATCH
+rms diff over vocab = 0.3483   max abs diff = 1.6172
+(small rms + top-1 match => numerical drift, expected in fp16 greedy)

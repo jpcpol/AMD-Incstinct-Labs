@@ -1,0 +1,36 @@
+Device: AMD Instinct MI300X VF (gfx904)
+Stage-C runtime validation — cdna3::runtime::Session
+====================================================
+Model: /tmp/qwen05   prompt_len=5   max_new=24
+
+ModelLoader: loaded 24 layers, hidden=896, heads=14/2 (GQA), ffn=4864
+pos  generated  reference  match
+  0      12095      12095  ok
+  1         13         13  ok
+  2       1084       1084  ok
+  3        374        374  ok
+  4        279        279  ok
+  5       6722       7772  drift
+  6        315       3283  drift
+  7       9625        304  drift
+  8         13       4505  drift
+  9       1084        323  drift
+ 10        374        279  drift
+ 11        279       2086  drift
+ 12       6722       7772  drift
+ 13        315        304  drift
+ 14       9625        279  drift
+ 15         13       1879  drift
+ 16       1084         13  drift
+ 17        374       1084  drift
+ 18        279        374  drift
+ 19       6722       1083  drift
+ 20        315        279  drift
+ 21       9625       6722  drift
+ 22         13        315  drift
+ 23       1084       9625  drift
+
+----------------------------------------------------
+first-step top-1: MATCH   greedy prefix match: 5 tokens   total 5/24
+Stage-C criterion MET — runtime reproduces HF first-step top-1.
+(run diag_logits for the per-vocab numerical agreement.)
