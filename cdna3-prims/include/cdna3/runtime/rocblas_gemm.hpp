@@ -56,7 +56,8 @@ class RocblasHandle {
 
     static void check(rocblas_status s, const char* where){
         if (s != rocblas_status_success){
-            printf("rocBLAS error %d at %s\n", (int)s, where);
+            fprintf(stderr, "rocBLAS error %d at %s\n", (int)s, where);
+            fflush(stderr);
             abort();
         }
     }
