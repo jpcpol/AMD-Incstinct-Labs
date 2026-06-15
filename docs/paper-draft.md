@@ -1,7 +1,8 @@
 # Eliminating LDS-Mediated Cross-Lane Communication on CDNA3: Full-DPP Wave64 Primitives and Their Application to Flash Attention on AMD Instinct MI300X
 
 **Draft — 2026-06-15**  
-Target: arXiv cs.DC
+Target: arXiv cs.DC  
+Data & code: [doi.org/10.5281/zenodo.20700838](https://doi.org/10.5281/zenodo.20700838)
 
 ---
 
