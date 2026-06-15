@@ -113,22 +113,21 @@ int main(){
     printf("cdna3-prims version: %d.%d\n\n", cdna3::VERSION_MAJOR, cdna3::VERSION_MINOR);
 
     printf("--- correctness (small configs, CPU-verified) ---\n");
-    run_cfg<64, 2>({0,256,256,2,2,1,0}, "MHA  full   seq256 h2", true);
-    run_cfg<128,2>({0,256,256,2,2,1,0}, "MHA  full   seq256 h2", true);
-    run_cfg<64, 4>({0,256,256,2,2,1,0}, "MHA  full   seq256 h2", true);
-    run_cfg<128,2>({0,256,256,4,2,1,0}, "GQA  full   seq256 4q2kv", true);
-    run_cfg<128,2>({0,256,256,2,2,1,1}, "MHA  causal seq256 h2", true);
-    run_cfg<128,2>({0,256,256,4,2,1,1}, "GQA  causal seq256 4q2kv", true);
+    run_cfg<64, 2>({0,256,256,2,2,1,0}, "MHA  full   seq256 h2 D64 W2", true);
+    run_cfg<128,1>({0,256,256,2,2,1,0}, "MHA  full   seq256 h2 D128 W1", true);
+    run_cfg<128,1>({0,256,256,4,2,1,0}, "GQA  full   seq256 4q2kv D128 W1", true);
+    run_cfg<128,1>({0,256,256,2,2,1,1}, "MHA  causal seq256 h2 D128 W1", true);
+    run_cfg<128,1>({0,256,256,4,2,1,1}, "GQA  causal seq256 4q2kv D128 W1", true);
 
-    printf("\n--- multi-wave seqLen sweep (D=128, MHA, full) --- compare to fa_robust ---\n");
+    printf("\n--- multi-wave seqLen sweep (D=128 W=1, MHA, full) --- compare to fa_robust ---\n");
     const int seqs[6]={512,1024,1536,2048,3072,4096};
-    for(int i=0;i<6;++i){ char l[40]; snprintf(l,sizeof(l),"MHA full seq%d",seqs[i]);
-        run_cfg<128,2>({0,seqs[i],seqs[i],8,8,1,0}, l, false); }
+    for(int i=0;i<6;++i){ char l[40]; snprintf(l,sizeof(l),"MHA full seq%d D128 W1",seqs[i]);
+        run_cfg<128,1>({0,seqs[i],seqs[i],8,8,1,0}, l, false); }
 
-    printf("\n--- W=4 variant (D=64, fits LDS) ---\n");
-    run_cfg<64,4>({0,2048,2048,8,8,1,0}, "MHA full seq2k D64", false);
+    printf("\n--- D=64 W=2 variant ---\n");
+    run_cfg<64,2>({0,2048,2048,8,8,1,0}, "MHA full seq2k D64 W2", false);
 
     printf("\nNotes: causal TFLOPS uses 0.5x work. Compare medians to fa_robust same config.\n");
-    printf("LDS budget: W=2 D=128 fits; W=4 needs D=64 (see DESIGN_multiwave_fa.md).\n");
+    printf("LDS budget (64 KB limit): W=1 D=128 ~ 51 KB; W=2 D=64 ~ 41 KB.\n");
     return 0;
 }

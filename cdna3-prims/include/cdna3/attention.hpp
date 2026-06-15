@@ -18,10 +18,10 @@
 //   cdna3::attn::DecodeCfg dcfg{D, N, nQH, nKVH};
 //   hipError_t e = cdna3::attn::decode(dq, dK, dV, do_, dcfg);
 //
-// ## Kernel dispatch (D → W selected for LDS budget on MI300X)
+// ## Kernel dispatch (D → W selected for LDS budget on MI300X, limit 64 KB)
 //
-//   Prefill D=128 → W=2 (LDS ≈ 60 KB); D=64 → W=4 (LDS ≈ 32 KB)
-//   Decode  D=128 → W=4; D=64 → W=4  (memory-bound; more waves = finer split)
+//   Prefill D=128 → W=1 (LDS ≈ 51 KB); D=64 → W=2 (LDS ≈ 41 KB)
+//   Decode  D=128 → W=4; D=64 → W=4  (memory-bound; decode LDS is tiny)
 //
 // ## Status (Stage B gates)
 //
@@ -90,13 +90,13 @@ inline hipError_t prefill(const __half* Q, const __half* K, const __half* V,
                     cfg.batch, cfg.causal };
 
     if (cfg.D == 128) {
-        constexpr int W = 2;
+        constexpr int W = 1;
         int sblocks = cfg.seqQ / (W * _Br);
         dim3 grid(cfg.batch * cfg.nQHeads * sblocks), block(W * 64);
         hipLaunchKernelGGL((fa_multiwave_kernel<128, W>), grid, block, 0, stream,
                            Q, K, V, O, kc);
     } else if (cfg.D == 64) {
-        constexpr int W = 4;
+        constexpr int W = 2;
         int sblocks = cfg.seqQ / (W * _Br);
         dim3 grid(cfg.batch * cfg.nQHeads * sblocks), block(W * 64);
         hipLaunchKernelGGL((fa_multiwave_kernel<64, W>), grid, block, 0, stream,
