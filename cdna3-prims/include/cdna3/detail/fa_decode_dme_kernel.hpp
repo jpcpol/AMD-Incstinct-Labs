@@ -53,13 +53,15 @@ struct DecodeDmeCfg {
 // Template parameters:
 //   D     — head dimension (64 or 128)
 //   W     — number of waves per block (split-K factor)
-//   kBc   — keys per DME tile (must be multiple of 64).
-//            LDS budget: 2×2×kBc×D×2 bytes for K+V double-buffers.
-//            D=64,  kBc=64, W=4: 32 KB + O_sh 1 KB = 33 KB  OK
-//            D=128, kBc=32, W=4: 32 KB + O_sh 2 KB = 34 KB  OK
-//            D=128, kBc=64, W=*: 64 KB + O_sh → overflow
+//   kBc   — keys per DME tile (must be multiple of 32).
+//            Each wave has private K+V double-buffers: W×2×kBc×D×2 bytes.
+//            D=64,  kBc=32, W=4: 4×2×32×64×2 = 32 KB + O_sh 1 KB = 33 KB  OK
+//            D=128, kBc=16, W=4: 4×2×16×128×2 = 32 KB + O_sh 2 KB = 34 KB  OK
+//
+//   Key design: each wave has private LDS buffers (K_buf[W][2][kBc*D]) so
+//   split-K waves don't race over the same tile. DME prefetch is per-wave.
 // ---------------------------------------------------------------------------
-template<int D, int W, int kBc=64>
+template<int D, int W, int kBc=32>
 __global__ void fa_decode_dme_kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ K,
@@ -67,8 +69,8 @@ __global__ void fa_decode_dme_kernel(
     __half*       __restrict__ o,
     DecodeDmeCfg c)
 {
-    static_assert(kBc % 32 == 0, "kBc must be a multiple of 32");
-    static_assert(2*2*kBc*D*2 + W*D*4 + W*4*2 <= 65536,
+    static_assert(kBc % 16 == 0, "kBc must be a multiple of 16");
+    static_assert(W*2*kBc*D*2 + W*D*4 + W*4*2 <= 65536,
         "fa_decode_dme_kernel: LDS budget exceeded — reduce kBc or W");
     constexpr int EPL  = D / 64;
 
@@ -103,29 +105,29 @@ __global__ void fa_decode_dme_kernel(
     #pragma unroll
     for (int e = 0; e < EPL; ++e) O_w[e] = 0.f;
 
-    // Double-buffer LDS: K_buf + V_buf, 2 ping/pong slots each.
-    // Layout: [2][kBc * D] fp16.
-    __shared__ __half K_buf[2][kBc * D];
-    __shared__ __half V_buf[2][kBc * D];
+    // Per-wave double-buffer LDS: each wave has its own K+V ping/pong slots.
+    // Layout: K_buf[W][2][kBc*D], V_buf[W][2][kBc*D].
+    // This prevents split-K waves from racing over the same tile.
+    __shared__ __half K_buf[W][2][kBc * D];
+    __shared__ __half V_buf[W][2][kBc * D];
     // Split-K merge LDS (wave 0 merges, same as fa_decode_kernel).
     __shared__ float m_sh[W], l_sh[W];
     __shared__ float O_sh[W][D];
 
-    // Cooperative tile parameters (all W waves in the block share the prefetch).
-    // Each wave contributes its own lanes to fill kBc*D elements cooperatively.
-    // Total threads in block = W * 64; kTileElems / 2 floats to copy.
-    const int tid      = threadIdx.x;            // flat thread index in block
-    const int nthreads = W * 64;                 // threads per block
+    // Each wave independently prefetches its own tiles using its own 64 lanes.
+    // tid_wave: lane index within the wave (0..63), used as tid for per-wave prefetch.
+    const int tid_wave = L;         // lane index within this wave
+    const int nthreads_wave = 64;   // one wave = 64 threads
 
     if (n_tiles > 0) {
         // ---------------------------------------------------------------------------
-        // Prologue: prefetch tile 0 from wave's key range into buf[0].
+        // Prologue: each wave prefetches its own tile 0 into K_buf[wave][0].
         // ---------------------------------------------------------------------------
         {
             const __half* Ksrc0 = Kh + (size_t)k0 * D;
             const __half* Vsrc0 = Vh + (size_t)k0 * D;
-            dme::prefetch_tile2d_fp16<kBc, D>(Ksrc0, K_buf[0], tid, nthreads);
-            dme::prefetch_tile2d_fp16<kBc, D>(Vsrc0, V_buf[0], tid, nthreads);
+            dme::prefetch_tile2d_fp16<kBc, D>(Ksrc0, K_buf[wave][0], tid_wave, nthreads_wave);
+            dme::prefetch_tile2d_fp16<kBc, D>(Vsrc0, V_buf[wave][0], tid_wave, nthreads_wave);
             dme::wait();
             __syncthreads();
         }
@@ -139,34 +141,34 @@ __global__ void fa_decode_dme_kernel(
             const int tile_k0 = k0 + jt * kBc;
             const int tile_k1 = (tile_k0 + kBc < k1) ? (tile_k0 + kBc) : k1;
 
-            // Async prefetch tile jt+1 into buf[nxt]
+            // Each wave async-prefetches its own next tile into K_buf[wave][nxt].
             if (jt + 1 < n_tiles) {
                 const int next_k0   = k0 + (jt + 1) * kBc;
                 const __half* Ksrc = Kh + (size_t)next_k0 * D;
                 const __half* Vsrc = Vh + (size_t)next_k0 * D;
-                dme::prefetch_tile2d_fp16<kBc, D>(Ksrc, K_buf[nxt], tid, nthreads);
-                dme::prefetch_tile2d_fp16<kBc, D>(Vsrc, V_buf[nxt], tid, nthreads);
+                dme::prefetch_tile2d_fp16<kBc, D>(Ksrc, K_buf[wave][nxt], tid_wave, nthreads_wave);
+                dme::prefetch_tile2d_fp16<kBc, D>(Vsrc, V_buf[wave][nxt], tid_wave, nthreads_wave);
             }
 
-            // Compute Q · K_buf[cur] + online softmax
+            // Compute Q · K_buf[wave][cur] + online softmax
             for (int k = tile_k0; k < tile_k1; ++k) {
                 const int ki = k - tile_k0;
                 float partial = 0.f;
                 #pragma unroll
                 for (int e = 0; e < EPL; ++e)
-                    partial += qreg[e] * __half2float(K_buf[cur][ki * D + L * EPL + e]);
+                    partial += qreg[e] * __half2float(K_buf[wave][cur][ki * D + L * EPL + e]);
                 float s    = reduce_sum_bcast(partial) * scale;
                 float mnew = fmaxf(m_w, s);
                 float p    = __expf(s - mnew);
                 float resc = __expf(m_w - mnew);
                 #pragma unroll
                 for (int e = 0; e < EPL; ++e)
-                    O_w[e] = O_w[e] * resc + p * __half2float(V_buf[cur][ki * D + L * EPL + e]);
+                    O_w[e] = O_w[e] * resc + p * __half2float(V_buf[wave][cur][ki * D + L * EPL + e]);
                 l_w = l_w * resc + p;
                 m_w = mnew;
             }
 
-            // Barrier: wait for next tile DME before next iter reads buf[nxt]
+            // Wait for DME + sync before next iter reads buf[nxt]
             if (jt + 1 < n_tiles) {
                 dme::wait();
                 __syncthreads();
