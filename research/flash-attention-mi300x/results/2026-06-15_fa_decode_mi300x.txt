@@ -1,0 +1,23 @@
+Device : AMD Instinct MI300X VF (gfx904)
+Decode FA (Stage-B cdna3-prims, split-KV, DPP dot+softmax via wave::dpp::)
+cdna3-prims version: 0.2
+
+--- correctness (CPU-verified) ---
+  MHA  D64  N128             D=64 W=4 N=128  err=0.00005 [PASS]  9.98 µs
+  MHA  D128 N128             D=128 W=4 N=128  err=0.00007 [PASS]  11.18 µs
+  GQA  D128 N512 32q8kv      D=128 W=4 N=512  err=0.00003 [PASS]  32.19 µs
+  MHA  D64  N256 W2          D=64 W=2 N=256  err=0.00004 [PASS]  28.46 µs
+
+--- N-sweep (D=128, GQA 32q/8kv, W=4) — expect ~linear in N ---
+  decode N256                D=128 W=4 N=256  (timing)  18.12 µs
+  decode N512                D=128 W=4 N=512  (timing)  32.19 µs
+  decode N1024               D=128 W=4 N=1024  (timing)  60.42 µs
+  decode N2048               D=128 W=4 N=2048  (timing)  118.71 µs
+  decode N4096               D=128 W=4 N=4096  (timing)  384.51 µs
+  decode N8192               D=128 W=4 N=8192  (timing)  803.42 µs
+
+--- split-KV scaling (D=128, GQA, N=4096): W=1 vs W=4 ---
+  decode W1                  D=128 W=1 N=4096  (timing)  1531.19 µs
+  decode W4                  D=128 W=4 N=4096  (timing)  384.67 µs
+
+Notes: decode is memory-bound (1×N). err threshold 0.15 (fp16).

@@ -1,0 +1,26 @@
+Device : AMD Instinct MI300X VF (gfx904)
+cdna3-prims version: 0.2
+
+cdna3::attn unified API — Stage-B validation
+==============================================
+
+-- Prefill (cdna3::attn::prefill) --
+  PREFILL MHA full D128 seq256 h2              err=0.00005  [PASS]
+  PREFILL GQA full D128 seq256 4q2kv           err=0.00006  [PASS]
+  PREFILL MHA causal D128 seq256 h2            err=0.00046  [PASS]
+  PREFILL GQA causal D128 seq256 4q2kv         err=0.00066  [PASS]
+  PREFILL MHA full D64  seq256 h2              err=0.00006  [PASS]
+  PREFILL MHA full D128 seq1024 h8             err=0.00004  [PASS]
+  PREFILL GQA causal D128 seq512 32q8kv        err=0.00061  [PASS]
+
+-- Decode (cdna3::attn::decode) --
+  DECODE  MHA D128 N128                        err=0.00007  [PASS]
+  DECODE  MHA D64  N128                        err=0.00005  [PASS]
+  DECODE  GQA D128 N512 32q8kv                 err=0.00003  [PASS]
+  DECODE  GQA D128 N1024 32q8kv                err=0.00002  [PASS]
+  DECODE  GQA D128 N4096 32q8kv                err=0.00001  [PASS]
+  DECODE  GQA D128 N8192 32q8kv                err=0.00001  [PASS]
+
+==============================================
+Result: 13/13 PASS
+Stage-B exit criterion MET — cdna3::attn API validated on hardware.

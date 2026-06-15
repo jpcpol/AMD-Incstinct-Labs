@@ -1,0 +1,24 @@
+Device : AMD Instinct MI300X VF (gfx904)
+Multi-wave FA (Stage-B cdna3-prims, W waves/block, DPP softmax, MFMA via cdna3::mfma)
+cdna3-prims version: 0.2
+
+--- correctness (small configs, CPU-verified) ---
+  MHA  full   seq256 h2 D64 W2   D=64 W=2  err=0.00006 [PASS]  63.9 µs  0.52 TFLOPS
+  MHA  full   seq256 h2 D128 W1  D=128 W=1  err=0.00008 [PASS]  106.6 µs  0.63 TFLOPS
+  GQA  full   seq256 4q2kv D128 W1 D=128 W=1  err=0.00005 [PASS]  106.7 µs  1.26 TFLOPS
+  MHA  causal seq256 h2 D128 W1  D=128 W=1  err=0.00046 [PASS]  106.4 µs  0.32 TFLOPS
+  GQA  causal seq256 4q2kv D128 W1 D=128 W=1  err=0.00050 [PASS]  106.6 µs  0.63 TFLOPS
+
+--- multi-wave seqLen sweep (D=128 W=1, MHA, full) --- compare to fa_robust ---
+  MHA full seq512 D128 W1        D=128 W=1  (timing only)  207.4 µs  5.18 TFLOPS
+  MHA full seq1024 D128 W1       D=128 W=1  (timing only)  863.0 µs  4.98 TFLOPS
+  MHA full seq1536 D128 W1       D=128 W=1  (timing only)  1874.0 µs  5.16 TFLOPS
+  MHA full seq2048 D128 W1       D=128 W=1  (timing only)  3280.9 µs  5.24 TFLOPS
+  MHA full seq3072 D128 W1       D=128 W=1  (timing only)  7245.8 µs  5.33 TFLOPS
+  MHA full seq4096 D128 W1       D=128 W=1  (timing only)  11534.4 µs  5.96 TFLOPS
+
+--- D=64 W=2 variant ---
+  MHA full seq2k D64 W2          D=64 W=2  (timing only)  965.6 µs  8.90 TFLOPS
+
+Notes: causal TFLOPS uses 0.5x work. Compare medians to fa_robust same config.
+LDS budget (64 KB limit): W=1 D=128 ~ 51 KB; W=2 D=64 ~ 41 KB.
