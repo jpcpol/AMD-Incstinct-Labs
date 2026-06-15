@@ -22,19 +22,22 @@
 // CDNA3-specific (guard with __gfx9__ at the call site if portability is needed).
 //
 // Evidence and composition patterns: docs/composition.md.
-// Status: Stage 1 (facade) — rests only on validated primitives. The attention module
-// (multi-wave / decode) joins as Stage 3 after VM validation. See docs/framework-vision.md.
+// Status: Stage B (attention module) — adds cdna3::attn::{prefill,decode} above
+// the validated primitives. Include <cdna3/attention.hpp> explicitly to get the
+// attention module (it includes the kernel .hip files; not included here to avoid
+// pulling main() into every consumer). See README.md for the A→B→C roadmap.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include "wave.hpp"   // wave::dpp::* (validated, zero-LDS) + portable fallbacks
 #include "dme.hpp"    // dme::* async copy (validated, −44.7% VMEM reads in FA)
 #include "mfma.hpp"   // cdna3::mfma::* verified 16×16×16 lane mapping (new, typed)
+// attention.hpp — cdna3::attn::{prefill,decode}  → include separately (pulls kernel .hip)
 
 namespace cdna3 {
 
 // Library version. Bump on API changes.
 static constexpr int VERSION_MAJOR = 0;
-static constexpr int VERSION_MINOR = 1;   // Stage 1: facade over validated primitives
+static constexpr int VERSION_MINOR = 2;   // Stage B: attention module added
 
 } // namespace cdna3
