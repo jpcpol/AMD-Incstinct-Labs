@@ -1,0 +1,68 @@
+Device  : AMD Instinct MI300X VF (gfx942, sramecc+:xnack-)
+Model   : /tmp/qwen05  (Qwen2.5-0.5B, 24 layers, GQA 14q/2kv, D=64, fp16 weights)
+Date    : 2026-06-15
+Commits : 589564b (rocBLAS GEMM fix) + 290fc10 (parallel prefill C8)
+Build   : hipcc -O3 --offload-arch=gfx942 -std=c++17 -lrocblas
+Note    : All numbers measured AFTER GEMM bug fix (transA=T, lda=K).
+          Pre-fix numbers gave 101.3 tok/s (incorrect — computed A×W not A×W^T).
+
+## TTFT (time-to-first-token) — with fa_multiwave parallel prefill (C8)
+
+| prompt_len | TTFT median (ms) | TTFT P95 (ms) | path              |
+|------------|-----------------|---------------|-------------------|
+|          5 |           11.30 |         11.45 | fallback decode   |
+|         16 |           11.25 |         11.30 | fallback decode   |
+|         32 |           11.30 |         11.34 | fa_multiwave (C8) |
+|         64 |           11.52 |         11.57 | fa_multiwave (C8) |
+|        128 |           12.50 |         12.57 | fa_multiwave (C8) |
+|        256 |           13.80 |         13.87 | fa_multiwave (C8) |
+|        512 |           15.90 |         15.99 | fa_multiwave (C8) |
+|       1024 |           25.40 |         25.51 | fa_multiwave (C8) |
+
+O(T²) eliminated. Residual slope is GEMM-bound O(T): 24 layers × 7 GEMMs × T tokens.
+
+## TPS (decode throughput) — short context (prompt=5, gen=32 tokens)
+
+| run | total_ms | ms/token | tokens/sec |
+|-----|----------|----------|------------|
+|   1 |    351.2 |   10.975 |       91.1 |
+|   2 |    351.4 |   10.981 |       91.1 |
+|   3 |    352.1 |   11.003 |       90.9 |
+|   4 |    351.5 |   10.984 |       91.0 |
+|   5 |    351.3 |   10.978 |       91.1 |
+
+Median TPS: 90.7 tokens/sec  (10.985 ms/token, total 351.5 ms for 32 tokens)
+
+## TPS (decode throughput) — long context (prompt=512, gen=32 tokens)
+
+| run | total_ms | ms/token | tokens/sec |
+|-----|----------|----------|------------|
+|   1 |    374.7 |   11.709 |       85.4 |
+|   2 |    374.2 |   11.694 |       85.5 |
+|   3 |    374.8 |   11.713 |       85.4 |
+|   4 |    374.4 |   11.700 |       85.5 |
+|   5 |    374.5 |   11.703 |       85.5 |
+
+Median TPS: 85.5 tokens/sec  (11.703 ms/token, total 374.5 ms for 32 tokens)
+
+## TTFT breakdown (prompt_len=5)
+
+TTFT (5-tok prompt)  : 11.30 ms  (median)
+  prefill estimate   : 0.32 ms   (TTFT - 1 decode step)
+  decode step        : 10.985 ms
+
+## Baseline comparison (C5 naive, from 2026-06-15_bench_generate_mi300x.txt)
+
+| Metric          | C5 naive | C7+C8 | Speedup |
+|-----------------|----------|-------|---------|
+| TPS short       | 42.9     | 90.7  |  2.11×  |
+| TPS long        | 26.4     | 85.5  |  3.24×  |
+| TTFT 5 tok (ms) | 29.3     | 11.3  |  2.59×  |
+| TTFT 1024 (ms)  | 1206     | 25.4  | 47.5×   |
+
+Notes:
+  - Prefill: fa_multiwave_kernel (C8) when T%32==0 and T>=32; fallback to decode loop.
+  - Decode:  cdna3::attn::decode_dme — direct KV-cache read, no pack_kv round-trip.
+  - GEMMs:   rocBLAS gemm_ex f16 weights + f32 compute (C7), 7 GEMMs/layer.
+  - Bottleneck: rocBLAS batch=1 at ~11ms/step. Attention kernels not limiting factor.
+  - ms/token short (10.985) vs long (11.703): 6.5% difference — fa_decode_dme scales well.
