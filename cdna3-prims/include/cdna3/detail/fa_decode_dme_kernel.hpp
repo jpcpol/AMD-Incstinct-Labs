@@ -63,7 +63,7 @@ __global__ void fa_decode_dme_kernel(
     __half*       __restrict__ o,
     DecodeDmeCfg c)
 {
-    static_assert(kBc % 64 == 0, "kBc must be multiple of 64");
+    static_assert(kBc % 32 == 0, "kBc must be a multiple of 32");
     static_assert(2*2*kBc*D*2 + W*D*4 + W*4*2 <= 65536,
         "fa_decode_dme_kernel: LDS budget exceeded — reduce kBc or W");
     constexpr int EPL  = D / 64;
