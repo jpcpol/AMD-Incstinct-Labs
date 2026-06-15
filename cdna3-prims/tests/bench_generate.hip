@@ -4,18 +4,26 @@
 // Measures two key LLM serving metrics for cdna3::runtime::Session:
 //
 //   TTFT  (time-to-first-token): prefill latency for prompt lengths 5..1024.
-//         Long prompts show the O(T^2) attention cost and pack_kv elimination.
+//         Parallel prefill (fa_multiwave, C8) eliminates O(T²) attention cost;
+//         TTFT is now GEMM-bound and nearly flat from 5 to 1024 tokens.
 //
 //   TPS   (tokens/second): decode throughput at two KV-cache fill levels:
 //         - short context (prompt_len=5):   cache nearly empty
 //         - long context (prompt_len=512):  cache 25% full (512/2048)
 //
-// Attention path: cdna3::attn::decode_dme (reads KV-cache directly, no pack_kv).
-// GEMM path: naive fp16→float accumulation (research reference, not rocBLAS).
+// Attention path:
+//   Prefill (T%32==0): cdna3::attn::prefill via fa_multiwave_kernel (C8).
+//   Prefill (T%32!=0): fallback to decode_dme loop (1-query-at-a-time).
+//   Decode:            cdna3::attn::decode_dme (reads KV-cache directly, no pack_kv).
+//
+// GEMM path: rocBLAS gemm_ex, f16 weights + f32 compute (C7).
+//   7 GEMMs/layer: Q/K/V projections, O-proj, gate/up/down MLP.
+//   lm_head: naive kernel (single call per step, not bottleneck).
 //
 // Compile (from cdna3-prims/tests/):
 //   /opt/rocm/bin/hipcc -O3 --offload-arch=gfx942 -std=c++17 \
-//     -I../include bench_generate.hip -o bench_generate
+//     -I../include -I/opt/rocm/include -L/opt/rocm/lib -lrocblas \
+//     bench_generate.hip -o bench_generate
 //
 // Run:
 //   ./bench_generate <model_dir>
@@ -184,11 +192,11 @@ int main(int argc, char** argv){
     }
 
     printf("Notes:\n");
-    printf("  - Attention path: cdna3::attn::decode_dme (reads KV-cache directly, no pack_kv)\n");
-    printf("  - GEMM path: naive fp16->float accumulation (research reference, not rocBLAS)\n");
-    printf("  - TTFT bottleneck: O(T^2) attention (1-query-at-a-time prefill)\n");
-    printf("  - Decode bottleneck: naive GEMM (O(N_gen * n_layers * H^2))\n");
-    printf("  - DME impact: visible at long context (N>>64) where attention dominates\n");
+    printf("  - Prefill path: fa_multiwave_kernel (C8) when T%%32==0; fallback decode_dme loop otherwise\n");
+    printf("  - Decode path:  cdna3::attn::decode_dme (reads KV-cache directly, no pack_kv round-trip)\n");
+    printf("  - GEMM path:    rocBLAS gemm_ex f16+f16->f32 (C7), 7 GEMMs/layer\n");
+    printf("  - TTFT:         GEMM-bound, flat 11-25ms across 5-1024 tokens (O(T^2) eliminated by C8)\n");
+    printf("  - Decode:       GEMM-bound ~11ms/step; attention O(N) not dominant (fa_decode_dme scales well)\n");
 
     return 0;
 }
