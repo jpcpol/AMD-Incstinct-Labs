@@ -63,11 +63,16 @@ def main():
     vocab_size = config.vocab_size
     rope_theta = getattr(config, "rope_theta", 10000.0)
 
+    # Detect QKV bias (Qwen2 has it; Llama does not)
+    prefix0 = "model." if "model.embed_tokens.weight" in sd else ""
+    has_qkv_bias = f"{prefix0}layers.0.self_attn.q_proj.bias" in sd
+
     meta = dict(
         n_layers=n_layers, hidden=hidden, n_heads=n_heads,
         n_kv_heads=n_kv_heads, head_dim=head_dim,
         ffn_dim=ffn_dim, vocab_size=vocab_size,
         rope_theta=rope_theta, model_id=args.model,
+        qkv_bias=1 if has_qkv_bias else 0,
     )
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -97,6 +102,10 @@ def main():
         save_fp16(t(lk("self_attn.k_proj")),    os.path.join(args.out, f"layer_{i}_k_proj.bin"))
         save_fp16(t(lk("self_attn.v_proj")),    os.path.join(args.out, f"layer_{i}_v_proj.bin"))
         save_fp16(t(lk("self_attn.o_proj")),    os.path.join(args.out, f"layer_{i}_o_proj.bin"))
+        if has_qkv_bias:
+            save_fp16(t(f"{lp}.self_attn.q_proj.bias"), os.path.join(args.out, f"layer_{i}_q_bias.bin"))
+            save_fp16(t(f"{lp}.self_attn.k_proj.bias"), os.path.join(args.out, f"layer_{i}_k_bias.bin"))
+            save_fp16(t(f"{lp}.self_attn.v_proj.bias"), os.path.join(args.out, f"layer_{i}_v_bias.bin"))
         save_fp16(t(lk("mlp.gate_proj")),        os.path.join(args.out, f"layer_{i}_gate_proj.bin"))
         save_fp16(t(lk("mlp.up_proj")),          os.path.join(args.out, f"layer_{i}_up_proj.bin"))
         save_fp16(t(lk("mlp.down_proj")),        os.path.join(args.out, f"layer_{i}_down_proj.bin"))

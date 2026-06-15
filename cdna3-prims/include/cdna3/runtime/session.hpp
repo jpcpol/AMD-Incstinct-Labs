@@ -119,6 +119,10 @@ class Session {
             dim3 gr((N+15)/16,(M+15)/16);
             hipLaunchKernelGGL(gemm_xwT_kernel,gr,tb,0,0,X,W,Y,M,N,K);
         };
+        auto gemm_b=[&](const __half* W,const __half* B,const __half* X,__half* Y,int M,int N,int K){
+            dim3 gr((N+15)/16,(M+15)/16);
+            hipLaunchKernelGGL(gemm_xwT_bias_kernel,gr,tb,0,0,X,W,B,Y,M,N,K);
+        };
 
         fill_rope(pos0, T);
 
@@ -128,10 +132,10 @@ class Session {
             // 1. attn RMSNorm
             hipLaunchKernelGGL(rmsnorm_kernel,dim3(T),dim3(256),0,0,d_hidden,L.norm_attn,d_norm,T,H,1e-6f);
 
-            // 2. QKV projections (token-major [T, qd]/[T, kvd])
-            gemm(L.Wq,d_norm,d_q,T,qd, H);
-            gemm(L.Wk,d_norm,d_k,T,kvd,H);
-            gemm(L.Wv,d_norm,d_v,T,kvd,H);
+            // 2. QKV projections (token-major [T, qd]/[T, kvd]); +bias if present (Qwen2)
+            gemm_b(L.Wq,L.bq,d_norm,d_q,T,qd, H);
+            gemm_b(L.Wk,L.bk,d_norm,d_k,T,kvd,H);
+            gemm_b(L.Wv,L.bv,d_norm,d_v,T,kvd,H);
 
             // 3. RoPE on Q and K (positions pos0..pos0+T)
             hipLaunchKernelGGL(rope_kernel,grid1d((size_t)T*c.n_heads*D),dim3(256),0,0,d_q,d_cos,d_sin,T,c.n_heads,D);

@@ -64,6 +64,9 @@ struct LayerWeights {
     __half* Wk   = nullptr;   // [hidden × (n_kv_heads × head_dim)]
     __half* Wv   = nullptr;
     __half* Wo   = nullptr;   // [hidden × hidden]
+    __half* bq   = nullptr;   // [n_heads × head_dim]   (Qwen2 QKV bias; nullptr if none)
+    __half* bk   = nullptr;   // [n_kv_heads × head_dim]
+    __half* bv   = nullptr;
     __half* Wgate= nullptr;   // [ffn_dim × hidden]
     __half* Wup  = nullptr;
     __half* Wdown= nullptr;   // [hidden × ffn_dim]
@@ -148,6 +151,7 @@ public:
         w_.cfg.ffn_dim    = std::stoi(meta["ffn_dim"]);
         w_.cfg.vocab_size = std::stoi(meta["vocab_size"]);
         w_.cfg.rope_theta = std::stof(meta.count("rope_theta") ? meta["rope_theta"] : "10000.0");
+        bool qkv_bias = meta.count("qkv_bias") && (meta["qkv_bias"]=="1" || meta["qkv_bias"]=="true");
 
         const auto& c = w_.cfg;
         int H = c.hidden, F = c.ffn_dim, V = c.vocab_size;
@@ -171,7 +175,12 @@ public:
             lw.Wq       = load_tensor(lp("q_proj"),    (size_t)qd *H);
             lw.Wk       = load_tensor(lp("k_proj"),    (size_t)kvd*H);
             lw.Wv       = load_tensor(lp("v_proj"),    (size_t)kvd*H);
-            lw.Wo       = load_tensor(lp("o_proj"),    (size_t)H  *H);
+            lw.Wo       = load_tensor(lp("o_proj"),    (size_t)H  *qd);
+            if (qkv_bias) {
+                lw.bq   = load_tensor(lp("q_bias"), (size_t)qd);
+                lw.bk   = load_tensor(lp("k_bias"), (size_t)kvd);
+                lw.bv   = load_tensor(lp("v_bias"), (size_t)kvd);
+            }
             lw.Wgate    = load_tensor(lp("gate_proj"), (size_t)F  *H);
             lw.Wup      = load_tensor(lp("up_proj"),   (size_t)F  *H);
             lw.Wdown    = load_tensor(lp("down_proj"), (size_t)H  *F);
@@ -186,6 +195,7 @@ public:
     ~ModelLoader() {
         for (auto& lw : w_.layers) {
             hipFree(lw.Wq); hipFree(lw.Wk); hipFree(lw.Wv); hipFree(lw.Wo);
+            hipFree(lw.bq); hipFree(lw.bk); hipFree(lw.bv);
             hipFree(lw.Wgate); hipFree(lw.Wup); hipFree(lw.Wdown);
             hipFree(lw.norm_attn); hipFree(lw.norm_mlp);
         }

@@ -60,6 +60,20 @@ __global__ void gemm_xwT_kernel(const __half* __restrict__ X, const __half* __re
     Y[(size_t)row*N+col] = __float2half(acc);
 }
 
+// Same as gemm_xwT_kernel but adds a per-output-column bias B[N] (Qwen2 QKV).
+// If B==nullptr behaves like gemm_xwT_kernel.
+__global__ void gemm_xwT_bias_kernel(const __half* __restrict__ X, const __half* __restrict__ W,
+                                     const __half* __restrict__ B,
+                                     __half* __restrict__ Y, int M, int N, int K){
+    int row = blockIdx.y*blockDim.y + threadIdx.y;
+    int col = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+    float acc = B ? __half2float(B[col]) : 0.f;
+    for (int k = 0; k < K; ++k)
+        acc += __half2float(X[(size_t)row*K+k]) * __half2float(W[(size_t)col*K+k]);
+    Y[(size_t)row*N+col] = __float2half(acc);
+}
+
 // ---------------------------------------------------------------------------
 // RoPE in place on [seq, heads*D]. cos/sin are [seq, D] (precomputed per pos).
 // rotate-half convention (Llama/Qwen2). Lifted from 2-B validation.
