@@ -11,9 +11,13 @@
 //
 // Row-major → col-major identity:
 //   Want:  C[M,N] = A[M,K] × W[N,K]ᵀ   (row-major)
-//   Equiv: C^T[N,M] = W[N,K] × A^T[K,M]  (col-major, what rocBLAS sees)
-//   Call:  gemm(transA=N, transB=N, m=N, n=M, k=K,
-//               W, lda=N,  A, ldb=K,  C, ldc=N)
+//   rocBLAS sees row-major[R,C] as col-major[C,R] (the transpose).
+//   Both A and W are row-major in memory; to get A×W^T we apply transA=T to
+//   undo the implicit transpose on A, leaving transB=N for W (which rocBLAS reads
+//   as W^T col-major = W row-major, exactly what we want to transpose).
+//   Call:  gemm(transA=T, transB=N, m=N, n=M, k=K,
+//               W, lda=K,  A, ldb=K,  C, ldc=N)
+//   Verified empirically: test_gemm4 passes for M=2,N=3,K=4.
 //
 // Bias: rocBLAS gemm_ex doesn't support fused bias. Added as a separate kernel.
 // ---------------------------------------------------------------------------
@@ -102,10 +106,8 @@ public:
     // C[M,N] = A[M,K] × W[N,K]ᵀ    A=float activations, W=fp16 weights, C=float
     //
     // Steps: (1) cast A→fp16 scratch, (2) rocBLAS gemm_ex f16+f16→f32.
-    //
-    // rocBLAS col-major call:
-    //   C^T[N,M] = W[N,K] × A^T[K,M]
-    //   gemm(N,N, m=N, n=M, k=K, W, lda=N, A_f16, ldb=K, C, ldc=N)
+    // rocBLAS call (see header comment for derivation):
+    //   gemm(transA=T, transB=N, m=N, n=M, k=K, W, lda=K, A_f16, ldb=K, C, ldc=N)
     // -------------------------------------------------------------------------
     void gemm_f32act_f16w_f32out(
         const float* A, const __half* W, float* C,
@@ -124,16 +126,16 @@ public:
         float alpha = 1.f, beta = 0.f;
         check(rocblas_gemm_ex(
             h_,
-            rocblas_operation_none,       // W [N,K] no-trans
-            rocblas_operation_none,       // A^T [K,M] no-trans
+            rocblas_operation_transpose,  // op(W[N,K] row-major) = W^T ... gives W
+            rocblas_operation_none,       // op(A[M,K] row-major) = A^T ... leaves W×A^T
             N, M, K,                      // m, n, k
             &alpha,
-            W,    rocblas_datatype_f16_r, N,   // A matrix (= W[N,K])
-            tmp_, rocblas_datatype_f16_r, K,   // B matrix (= A^T[K,M])
+            W,    rocblas_datatype_f16_r, K,   // W[N,K] row-major, lda=K
+            tmp_, rocblas_datatype_f16_r, K,   // A[M,K] row-major, ldb=K
             &beta,
-            C,    rocblas_datatype_f32_r, N,   // C matrix
-            C,    rocblas_datatype_f32_r, N,   // D = C
-            rocblas_datatype_f32_r,            // compute type: f32
+            C,    rocblas_datatype_f32_r, N,   // C^T[N,M] col-major → read as C[M,N] row-major
+            C,    rocblas_datatype_f32_r, N,
+            rocblas_datatype_f32_r,
             rocblas_gemm_algo_standard, 0, 0
         ), "gemm_f32act_f16w_f32out");
     }
@@ -143,9 +145,7 @@ public:
     //
     // C[M,N] = A[M,K] × W[N,K]ᵀ    A=float, W=fp16, C=fp16.
     // Used for QKV projections (attention expects fp16 input).
-    //
-    // rocBLAS f16+f16→f16 with compute=f32:
-    //   a=b=f16, c=d=f16, compute=f32 is supported.
+    // Same rocBLAS call as f32out variant, output type changed to f16.
     // -------------------------------------------------------------------------
     void gemm_f32act_f16w_f16out(
         const float* A, const __half* W, __half* C,
@@ -163,11 +163,11 @@ public:
         float alpha = 1.f, beta = 0.f;
         check(rocblas_gemm_ex(
             h_,
-            rocblas_operation_none,
+            rocblas_operation_transpose,
             rocblas_operation_none,
             N, M, K,
             &alpha,
-            W,    rocblas_datatype_f16_r, N,
+            W,    rocblas_datatype_f16_r, K,
             tmp_, rocblas_datatype_f16_r, K,
             &beta,
             C,    rocblas_datatype_f16_r, N,
@@ -194,11 +194,11 @@ public:
         float alpha = 1.f, beta = 0.f;
         check(rocblas_gemm_ex(
             h_,
-            rocblas_operation_none,
+            rocblas_operation_transpose,
             rocblas_operation_none,
             N, M, K,
             &alpha,
-            W,    rocblas_datatype_f16_r, N,
+            W,    rocblas_datatype_f16_r, K,
             A,    rocblas_datatype_f16_r, K,
             &beta,
             C,    rocblas_datatype_f32_r, N,
