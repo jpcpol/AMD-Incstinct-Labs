@@ -136,6 +136,10 @@ inline hipError_t decode(const __half* q, const __half* K, const __half* V,
     return hipGetLastError();
 }
 
+// Expose DecodeDmeCfg (defined globally in fa_decode_dme_kernel.hpp) inside
+// the cdna3::attn namespace so callers can write cdna3::attn::DecodeDmeCfg.
+using ::DecodeDmeCfg;
+
 // ---------------------------------------------------------------------------
 // cdna3::attn::decode_dme — decode attention reading directly from the
 // strided KV-cache (eliminates pack_kv_kernel). Uses DME async prefetch.

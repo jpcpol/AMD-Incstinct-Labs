@@ -33,9 +33,14 @@
 
 using wave::dpp::reduce_sum_bcast;
 
+// DecodeDmeCfg is defined in cdna3::attn namespace (attention.hpp).
+// Declared here as a forward for use inside the __global__ template.
+// The struct body is in attention.hpp to keep it co-located with DecodeCfg.
+// We need a local alias to avoid a circular include; declare an identical struct
+// in the global namespace and static_assert field layout matches.
 struct DecodeDmeCfg {
     int D, N, nQHeads, nKVHeads;
-    int stride_kv;   // = max_seq (elements between consecutive seq positions in cache)
+    int stride_kv;
 };
 
 // ---------------------------------------------------------------------------
