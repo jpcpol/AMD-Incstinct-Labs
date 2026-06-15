@@ -127,3 +127,14 @@ built on unproven ground, the failure mode the project has consistently avoided.
 CAL-L4 note: this framework is an AMD-side artifact. CAL-L4 needs the *data* (delivered)
 and, far out, an RCC proxy; the framework is not on the CAL critical path. See
 `docs/framework-vision.md` §6.
+
+---
+
+## Out of scope — G3 Infinity Fabric AllReduce
+
+The original research plan included a G3 area (topology-aware AllReduce over the
+MI300X Infinity Fabric full-mesh, 8×GPU). **This is permanently out of scope:**
+8×MI300X instances are not available on the AMD Developer Cloud and are not
+expected to become available. The single-GPU framework (A→B→C) is the complete
+research artifact. Multi-GPU AllReduce remains an open gap in the ROCm ecosystem
+and is documented as such in `docs/gap-analysis.md`.
