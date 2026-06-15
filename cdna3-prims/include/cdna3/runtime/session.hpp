@@ -248,6 +248,27 @@ public:
         return seq;
     }
 
+    // Diagnostic: run prefill only, return fp32 logits of the last prompt token.
+    std::vector<float> prefill_logits(const std::vector<int>& input_ids){
+        const auto& c = w_->cfg;
+        int H=c.hidden, V=c.vocab_size;
+        int Tin=(int)input_ids.size();
+        alloc_scratch(std::max(Tin,1));
+        hipMemcpy(d_ids, input_ids.data(), Tin*sizeof(int), hipMemcpyHostToDevice);
+        hipLaunchKernelGGL(embed_gather_kernel,dim3(Tin),dim3(256),0,0,
+                           w_->embed_tokens,d_ids,d_hidden,Tin,H);
+        kv_.len=0;
+        run_layers(Tin,0,true);
+        kv_.len=Tin;
+        const __half* last=d_hidden+(size_t)(Tin-1)*H;
+        dim3 tb(16,16), gr((V+15)/16,1);
+        hipLaunchKernelGGL(gemm_xwT_kernel,gr,tb,0,0,last,w_->lm_head,d_logits,1,V,H);
+        std::vector<__half> h(V); hipMemcpy(h.data(),d_logits,(size_t)V*2,hipMemcpyDeviceToHost);
+        std::vector<float> out(V);
+        for (int i=0;i<V;++i) out[i]=__half2float(h[i]);
+        return out;
+    }
+
 private:
     // Compute logits for the LAST of T hidden rows, return argmax token.
     int greedy_from_last(int T){

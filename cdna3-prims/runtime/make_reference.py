@@ -36,6 +36,16 @@ def main():
     print(f"prompt: {args.prompt!r}")
     print(f"prompt_ids: {ids[0].tolist()}")
 
+    # Diagnostic: logits of the last prompt token (first decode step).
+    with torch.no_grad():
+        logits = model(ids).logits[0, -1].float()   # [vocab]
+    topv, topi = torch.topk(logits, 10)
+    print("HF first-step top-10 logits:")
+    for v, idx in zip(topv.tolist(), topi.tolist()):
+        print(f"   id={idx:6d}  logit={v:8.3f}  {tok.decode([idx])!r}")
+    # Dump full first-step logits (fp32) for numerical comparison.
+    logits.numpy().tofile(os.path.join(args.out, "ref_logits0.bin"))
+
     with torch.no_grad():
         out = model.generate(ids, max_new_tokens=args.max_new, do_sample=False,
                              num_beams=1, temperature=None, top_p=None, top_k=None)
