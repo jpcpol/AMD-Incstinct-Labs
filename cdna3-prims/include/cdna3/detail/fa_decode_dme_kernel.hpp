@@ -44,36 +44,29 @@ struct DecodeDmeCfg {
 };
 
 // ---------------------------------------------------------------------------
-// fa_decode_dme_kernel<D, W>
+// fa_decode_dme_kernel<D, W, kBc>
 //
 // Template parameters:
 //   D     — head dimension (64 or 128)
-//   W     — number of waves per block (= split-K factor, typically 4)
-//
-// Each block handles one query head. Within the block, W waves split the
-// key range [0, N) into W equal parts, then merge via LDS (wave 0 owns output).
-//
-// DME pipeline (per wave, per Bc-key tile):
-//   Prologue:  prefetch tile 0 → K_buf[0], V_buf[0]; dme::wait(); sync
-//   Loop j:
-//     1. Issue async DME for tile j+1 → K_buf[next], V_buf[next]
-//     2. Compute dot(Q, K_buf[cur][k]) for k in [j*Bc, (j+1)*Bc) ∩ wave range
-//     3. DPP softmax update (wave-scope, zero LDS)
-//     4. dme::wait(); sync — K_buf[next] now ready for j+1
-//     5. Accumulate O from V_buf[cur] (V arrived in same prefetch as K)
-//   Epilogue:  split-K merge across W waves via LDS (wave 0 writes output)
+//   W     — number of waves per block (split-K factor)
+//   kBc   — keys per DME tile (must be multiple of 64).
+//            LDS budget: 2×2×kBc×D×2 bytes for K+V double-buffers.
+//            D=64,  kBc=64, W=4: 32 KB + O_sh 1 KB = 33 KB  OK
+//            D=128, kBc=32, W=4: 32 KB + O_sh 2 KB = 34 KB  OK
+//            D=128, kBc=64, W=*: 64 KB + O_sh → overflow
 // ---------------------------------------------------------------------------
-template<int D, int W>
+template<int D, int W, int kBc=64>
 __global__ void fa_decode_dme_kernel(
-    const __half* __restrict__ q,          // [nQHeads, D]
-    const __half* __restrict__ K,          // [nKVHeads, max_seq, D] head-major
-    const __half* __restrict__ V,          // [nKVHeads, max_seq, D] head-major
-    __half*       __restrict__ o,          // [nQHeads, D]
+    const __half* __restrict__ q,
+    const __half* __restrict__ K,
+    const __half* __restrict__ V,
+    __half*       __restrict__ o,
     DecodeDmeCfg c)
 {
-    constexpr int kBc  = 64;                   // keys per DME tile (= one wave width)
-    constexpr int EPL  = D / 64;               // head-dim elements per lane
-    constexpr int kTileElems = kBc * D;        // fp16 elements per tile
+    static_assert(kBc % 64 == 0, "kBc must be multiple of 64");
+    static_assert(2*2*kBc*D*2 + W*D*4 + W*4*2 <= 65536,
+        "fa_decode_dme_kernel: LDS budget exceeded — reduce kBc or W");
+    constexpr int EPL  = D / 64;
 
     const int wave   = threadIdx.x / 64;
     const int L      = threadIdx.x % 64;

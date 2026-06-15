@@ -153,19 +153,18 @@ inline hipError_t decode_dme(const __half* q, const __half* K, const __half* V,
                               __half* o, const DecodeDmeCfg& cfg,
                               hipStream_t stream = nullptr)
 {
-    // LDS budget check (64 KB limit, kBc=64 tiles):
-    //   D=64,  W=4: K_buf+V_buf = 2×2×64×64×2 = 32 KB + O_sh 1 KB → 33 KB  OK
-    //   D=128, W=2: K_buf+V_buf = 2×2×64×128×2 = 64 KB — use W=1 for headroom
-    //   D=128, W=1: K_buf+V_buf = 2×1×64×128×2 = 32 KB + O_sh 0.5 KB → OK
+    // LDS budget (64 KB limit):
+    //   D=64,  kBc=64, W=4: 2×2×64×64×2 + W×D×4 = 32768+1024 = 33 KB  OK
+    //   D=128, kBc=32, W=4: 2×2×32×128×2 + W×D×4 = 32768+2048 = 34 KB  OK
     if (cfg.D == 128) {
-        constexpr int W = 1;   // W=1 keeps LDS at 32 KB for D=128 tiles
+        constexpr int W = 4, kBc = 32;
         dim3 grid(cfg.nQHeads), block(W * 64);
-        hipLaunchKernelGGL((fa_decode_dme_kernel<128, W>), grid, block, 0, stream,
+        hipLaunchKernelGGL((fa_decode_dme_kernel<128, W, kBc>), grid, block, 0, stream,
                            q, K, V, o, cfg);
     } else if (cfg.D == 64) {
-        constexpr int W = 4;
+        constexpr int W = 4, kBc = 64;
         dim3 grid(cfg.nQHeads), block(W * 64);
-        hipLaunchKernelGGL((fa_decode_dme_kernel<64, W>), grid, block, 0, stream,
+        hipLaunchKernelGGL((fa_decode_dme_kernel<64, W, kBc>), grid, block, 0, stream,
                            q, K, V, o, cfg);
     } else {
         return hipErrorInvalidValue;
