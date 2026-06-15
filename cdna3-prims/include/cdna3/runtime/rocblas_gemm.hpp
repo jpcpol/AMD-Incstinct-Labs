@@ -110,7 +110,7 @@ public:
             &beta,
             C,    rocblas_datatype_f32_r, N,   // c, c_type, ldc
             C,    rocblas_datatype_f32_r, N,   // d, d_type, ldd
-            rocblas_compute_type_f32,
+            rocblas_datatype_f32_r,  // compute type (f32 accumulation)
             rocblas_gemm_algo_standard, 0, 0
         ), "gemm_f32_f16w_f32out");
     }
@@ -141,7 +141,7 @@ public:
             &beta,
             C,    rocblas_datatype_f16_r, N,
             C,    rocblas_datatype_f16_r, N,
-            rocblas_compute_type_f32,
+            rocblas_datatype_f32_r,  // compute type (f32 accumulation)
             rocblas_gemm_algo_standard, 0, 0
         ), "gemm_f32_f16w_f16out");
     }
@@ -171,7 +171,7 @@ public:
             &beta,
             C,    rocblas_datatype_f32_r, N,
             C,    rocblas_datatype_f32_r, N,
-            rocblas_compute_type_f32,
+            rocblas_datatype_f32_r,  // compute type (f32 accumulation)
             rocblas_gemm_algo_standard, 0, 0
         ), "gemm_f16_f16w_f32out");
     }
