@@ -53,15 +53,15 @@ struct DecodeDmeCfg {
 // Template parameters:
 //   D     — head dimension (64 or 128)
 //   W     — number of waves per block (split-K factor)
-//   kBc   — keys per DME tile (must be multiple of 32).
+//   kBc   — keys per DME tile (must be multiple of 8).
 //            Each wave has private K+V double-buffers: W×2×kBc×D×2 bytes.
-//            D=64,  kBc=32, W=4: 4×2×32×64×2 = 32 KB + O_sh 1 KB = 33 KB  OK
-//            D=128, kBc=16, W=4: 4×2×16×128×2 = 32 KB + O_sh 2 KB = 34 KB  OK
+//            D=64,  kBc=16, W=4: 4×2×16×64×2  = 16 KB + merge 1 KB OK
+//            D=128, kBc=8,  W=4: 4×2×8×128×2  = 16 KB + merge 2 KB OK
 //
 //   Key design: each wave has private LDS buffers (K_buf[W][2][kBc*D]) so
 //   split-K waves don't race over the same tile. DME prefetch is per-wave.
 // ---------------------------------------------------------------------------
-template<int D, int W, int kBc=32>
+template<int D, int W, int kBc=16>
 __global__ void fa_decode_dme_kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ K,
@@ -69,7 +69,7 @@ __global__ void fa_decode_dme_kernel(
     __half*       __restrict__ o,
     DecodeDmeCfg c)
 {
-    static_assert(kBc % 16 == 0, "kBc must be a multiple of 16");
+    static_assert(kBc % 8 == 0, "kBc must be a multiple of 8");
     static_assert(W*2*kBc*D*2 + W*D*4 + W*4*2 <= 65536,
         "fa_decode_dme_kernel: LDS budget exceeded — reduce kBc or W");
     constexpr int EPL  = D / 64;

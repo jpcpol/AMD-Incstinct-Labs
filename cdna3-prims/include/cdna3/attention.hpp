@@ -154,15 +154,15 @@ inline hipError_t decode_dme(const __half* q, const __half* K, const __half* V,
                               hipStream_t stream = nullptr)
 {
     // LDS budget (64 KB limit), per-wave double-buffers W×2×kBc×D×2 bytes:
-    //   D=64,  kBc=32, W=4: 4×2×32×64×2  = 32 KB + O_sh 1 KB = 33 KB  OK
-    //   D=128, kBc=16, W=4: 4×2×16×128×2 = 32 KB + O_sh 2 KB = 34 KB  OK
+    //   D=64,  kBc=16, W=4: 4×2×16×64×2  = 16 KB + merge 1 KB < 64 KB OK
+    //   D=128, kBc=8,  W=4: 4×2×8×128×2  = 16 KB + merge 2 KB < 64 KB OK
     if (cfg.D == 128) {
-        constexpr int W = 4, kBc = 16;
+        constexpr int W = 4, kBc = 8;
         dim3 grid(cfg.nQHeads), block(W * 64);
         hipLaunchKernelGGL((fa_decode_dme_kernel<128, W, kBc>), grid, block, 0, stream,
                            q, K, V, o, cfg);
     } else if (cfg.D == 64) {
-        constexpr int W = 4, kBc = 32;
+        constexpr int W = 4, kBc = 16;
         dim3 grid(cfg.nQHeads), block(W * 64);
         hipLaunchKernelGGL((fa_decode_dme_kernel<64, W, kBc>), grid, block, 0, stream,
                            q, K, V, o, cfg);
