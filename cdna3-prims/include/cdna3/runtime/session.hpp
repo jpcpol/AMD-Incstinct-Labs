@@ -7,9 +7,12 @@
 // (Stage-B validated); the surrounding ops are the reference kernels in
 // forward.hpp.
 //
-// fp32-acc hardening (C4): d_hidden, d_norm, d_gate, d_up, d_mlp are float to
-// eliminate 24-layer residual drift. Weights remain fp16. Attention I/O stays
-// fp16. H3/T-030 confirmed fp32-acc is faster AND more precise on CDNA3.
+// fp32-acc (C4): d_hidden/d_norm/d_gate/d_up/d_mlp are float — eliminates 24-layer
+// residual drift. H3/T-030 confirmed fp32-acc is faster AND more precise on CDNA3.
+//
+// DME decode (C6): attention uses cdna3::attn::decode_dme which reads the KV-cache
+// directly with its strided layout [n_kv_heads, max_seq, D]. Eliminates the O(T²)
+// pack_kv_kernel round-trip that was copying cache rows into a contiguous buffer.
 //
 // ## Usage
 //   cdna3::runtime::Session sess("/tmp/qwen25_1b", /*max_seq*/4096);
@@ -49,7 +52,6 @@ class Session {
     float  *d_oproj=nullptr;                             // [T, H] float (O-proj result)
     float  *d_gate=nullptr, *d_up=nullptr, *d_mlp=nullptr; // [T, F/H] float
     __half *d_logits=nullptr;                            // [1, V] fp16
-    __half *d_kpack=nullptr, *d_vpack=nullptr;           // [n_kv_heads, Nkeys, D] fp16
     float  *d_cos=nullptr, *d_sin=nullptr;
     int    *d_ids=nullptr, *d_argmax=nullptr;
     int    cap_tokens_=0;
@@ -73,8 +75,6 @@ class Session {
         hipMalloc(&d_v,     (size_t)T*kvd*2);
         hipMalloc(&d_attn_tok,(size_t)T*qd*2);
         hipMalloc(&d_logits,(size_t)V*2);                   // always 1 token
-        hipMalloc(&d_kpack, (size_t)c.n_kv_heads*max_seq_*c.head_dim*2);
-        hipMalloc(&d_vpack, (size_t)c.n_kv_heads*max_seq_*c.head_dim*2);
         hipMalloc(&d_cos,   (size_t)max_seq_*c.head_dim*4);
         hipMalloc(&d_sin,   (size_t)max_seq_*c.head_dim*4);
         hipMalloc(&d_ids,   (size_t)T*sizeof(int));
@@ -85,13 +85,13 @@ class Session {
         for (void* p : {(void*)d_hidden,(void*)d_norm,(void*)d_oproj,
                         (void*)d_gate,(void*)d_up,(void*)d_mlp,
                         (void*)d_q,(void*)d_k,(void*)d_v,(void*)d_attn_tok,
-                        (void*)d_logits,(void*)d_kpack,(void*)d_vpack,
+                        (void*)d_logits,
                         (void*)d_cos,(void*)d_sin,(void*)d_ids,(void*)d_argmax})
             if (p) hipFree(p);
         d_hidden=d_norm=d_oproj=nullptr;
         d_gate=d_up=d_mlp=nullptr;
         d_q=d_k=d_v=d_attn_tok=d_logits=nullptr;
-        d_kpack=d_vpack=nullptr; d_cos=d_sin=nullptr;
+        d_cos=d_sin=nullptr;
         d_ids=d_argmax=nullptr; cap_tokens_=0;
     }
 
@@ -159,17 +159,15 @@ class Session {
             // 4. append K/V into head-major cache at [pos0, pos0+T)
             append_kv(li, T, pos0);
 
-            // 5. attention: one query at a time via cdna3::attn::decode (fp16 I/O)
+            // 5. attention via decode_dme: reads cache directly (no pack_kv round-trip).
+            //    K/V layout in cache: [n_kv_heads, max_seq, D] with stride_kv = max_seq.
+            //    One call per query position (causal: query q sees Nkeys = pos0+q+1 keys).
             for (int q = 0; q < T; ++q){
                 int Nkeys = pos0 + q + 1;
-                hipLaunchKernelGGL(pack_kv_kernel,grid1d((size_t)c.n_kv_heads*Nkeys*D),dim3(256),0,0,
-                                   kv_.K_layer(li,0),d_kpack,c.n_kv_heads,Nkeys,D,max_seq_);
-                hipLaunchKernelGGL(pack_kv_kernel,grid1d((size_t)c.n_kv_heads*Nkeys*D),dim3(256),0,0,
-                                   kv_.V_layer(li,0),d_vpack,c.n_kv_heads,Nkeys,D,max_seq_);
                 const __half* q_in  = d_q       + (size_t)q*qd;
                 __half*       q_out = d_attn_tok + (size_t)q*qd;
-                attn::DecodeCfg dc{D,Nkeys,c.n_heads,c.n_kv_heads};
-                attn::decode(q_in, d_kpack, d_vpack, q_out, dc);
+                attn::DecodeDmeCfg dc{D, Nkeys, c.n_heads, c.n_kv_heads, max_seq_};
+                attn::decode_dme(q_in, kv_.K_layer(li,0), kv_.V_layer(li,0), q_out, dc);
             }
 
             // 6. O projection: fp16 attn_out → float d_oproj; residual add into float hidden
