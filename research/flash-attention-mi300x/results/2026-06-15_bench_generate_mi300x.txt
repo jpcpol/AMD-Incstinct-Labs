@@ -1,0 +1,35 @@
+Device  : AMD Instinct MI300X VF
+Model   : /tmp/qwen05
+
+## TTFT (time-to-first-token)
+
+| prompt_len | TTFT median (ms) | TTFT P95 (ms) |
+|------------|-----------------|---------------|
+|          5 |           29.30 |         29.34 |
+|         16 |           37.97 |         37.98 |
+|         32 |           46.63 |         46.68 |
+|         64 |           65.96 |         65.99 |
+
+## TPS (decode throughput, prompt_len=5, gen=32 tokens)
+
+| run | total_ms | ms/token | tokens/sec |
+|-----|----------|----------|------------|
+|   1 |    745.2 |   23.286 |       42.9 |
+|   2 |    744.9 |   23.279 |       43.0 |
+|   3 |    745.2 |   23.288 |       42.9 |
+|   4 |    745.2 |   23.288 |       42.9 |
+|   5 |    745.0 |   23.280 |       43.0 |
+
+Median TPS: 42.9 tokens/sec  (23.286 ms/token, total 745.2 ms for 32 tokens)
+
+## TTFT breakdown (prompt_len=5)
+
+TTFT (5-tok prompt)  : 29.29 ms  (median)
+  prefill estimate   : 6.02 ms  (TTFT - 1 decode step)
+  decode step        : 23.279 ms
+
+Notes:
+  - Attention path: cdna3::attn::decode, 1-query-at-a-time (correctness-first)
+  - GEMM path: naive fp16→float accumulation (research reference, not rocBLAS)
+  - Bottleneck: O(T^2) pack_kv_kernel + cdna3::attn::decode per prefill step
+  - Decode is O(N_gen × n_layers × D^2) — linear in generated length
