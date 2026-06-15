@@ -18,6 +18,12 @@
 // f32 compute) via RocblasHandle. Replaces the naive tile-GEMM kernels in forward.hpp
 // for Q/K/V/O projections and gate/up/down MLP — lm_head stays naive (once per step).
 //
+// Parallel prefill (C8): when T is a multiple of W*Br (32 for D=64), attention uses
+// fa_multiwave_kernel via cdna3::attn::prefill — all T queries processed in one kernel
+// launch instead of T serial decode_dme calls. For short/misaligned T, falls back to
+// the per-token decode_dme loop. Q/K/V are repacked token-major→head-major before the
+// call and O is repacked back; repack_kernel is already in forward.hpp.
+//
 // ## Usage
 //   cdna3::runtime::Session sess("/tmp/qwen25_1b", /*max_seq*/4096);
 //   auto out = sess.generate(input_ids, {/*max_new_tokens*/256});
@@ -53,13 +59,15 @@ class Session {
     // scratch device buffers (allocated for the widest stage: prefill of prompt)
     // fp32-acc: hidden state and MLP activations in float; attn I/O stays __half.
     float  *d_hidden=nullptr, *d_norm=nullptr;           // [T, H] float
-    __half *d_q=nullptr, *d_k=nullptr, *d_v=nullptr;    // [T, qd/kvd] fp16
+    __half *d_q=nullptr, *d_k=nullptr, *d_v=nullptr;    // [T, qd/kvd] fp16 token-major
     __half *d_attn_tok=nullptr;                          // [T, qd] fp16 (attn output)
     float  *d_oproj=nullptr;                             // [T, H] float (O-proj result)
     float  *d_gate=nullptr, *d_up=nullptr, *d_mlp=nullptr; // [T, F/H] float
     __half *d_logits=nullptr;                            // [1, V] fp16
     float  *d_cos=nullptr, *d_sin=nullptr;
     int    *d_ids=nullptr, *d_argmax=nullptr;
+    // head-major scratch for fa_multiwave prefill: [nH, T, D]
+    __half *d_qh=nullptr, *d_kh=nullptr, *d_vh=nullptr, *d_oh=nullptr;
     int    cap_tokens_=0;
 
     void alloc_scratch(int T){
@@ -75,7 +83,7 @@ class Session {
         hipMalloc(&d_gate,  (size_t)T*F*4);
         hipMalloc(&d_up,    (size_t)T*F*4);
         hipMalloc(&d_mlp,   (size_t)T*H*4);
-        // fp16 buffers (2 bytes each)
+        // fp16 token-major buffers (2 bytes each)
         hipMalloc(&d_q,     (size_t)T*qd*2);
         hipMalloc(&d_k,     (size_t)T*kvd*2);
         hipMalloc(&d_v,     (size_t)T*kvd*2);
@@ -85,6 +93,11 @@ class Session {
         hipMalloc(&d_sin,   (size_t)max_seq_*c.head_dim*4);
         hipMalloc(&d_ids,   (size_t)T*sizeof(int));
         hipMalloc(&d_argmax,sizeof(int));
+        // head-major scratch for parallel prefill (fa_multiwave_kernel layout)
+        hipMalloc(&d_qh, (size_t)T*qd*2);
+        hipMalloc(&d_kh, (size_t)T*kvd*2);
+        hipMalloc(&d_vh, (size_t)T*kvd*2);
+        hipMalloc(&d_oh, (size_t)T*qd*2);
         cap_tokens_ = T;
     }
     void free_scratch(){
@@ -92,12 +105,14 @@ class Session {
                         (void*)d_gate,(void*)d_up,(void*)d_mlp,
                         (void*)d_q,(void*)d_k,(void*)d_v,(void*)d_attn_tok,
                         (void*)d_logits,
-                        (void*)d_cos,(void*)d_sin,(void*)d_ids,(void*)d_argmax})
+                        (void*)d_cos,(void*)d_sin,(void*)d_ids,(void*)d_argmax,
+                        (void*)d_qh,(void*)d_kh,(void*)d_vh,(void*)d_oh})
             if (p) hipFree(p);
         d_hidden=d_norm=d_oproj=nullptr;
         d_gate=d_up=d_mlp=nullptr;
         d_q=d_k=d_v=d_attn_tok=d_logits=nullptr;
         d_cos=d_sin=nullptr;
+        d_qh=d_kh=d_vh=d_oh=nullptr;
         d_ids=d_argmax=nullptr; cap_tokens_=0;
     }
 
@@ -164,13 +179,41 @@ class Session {
             // 4. append K/V into head-major cache at [pos0, pos0+T)
             append_kv(li, T, pos0);
 
-            // 5. attention via decode_dme: reads cache directly (no pack_kv round-trip).
-            for (int q = 0; q < T; ++q){
-                int Nkeys = pos0 + q + 1;
-                const __half* q_in  = d_q       + (size_t)q*qd;
-                __half*       q_out = d_attn_tok + (size_t)q*qd;
-                attn::DecodeDmeCfg dc{D, Nkeys, c.n_heads, c.n_kv_heads, max_seq_};
-                attn::decode_dme(q_in, kv_.K_layer(li,0), kv_.V_layer(li,0), q_out, dc);
+            // 5. attention — parallel prefill (fa_multiwave) when T is a multiple of
+            //    W*Br (W=2, Br=16 → multiple of 32 for D=64). Falls back to the
+            //    per-token decode_dme loop for short or misaligned prompts.
+            //
+            //    fa_multiwave expects head-major layout [nH, T, D].
+            //    d_q/d_k/d_v are token-major [T, nH*D] → repack before and after.
+            // W=2 for D=64, W=1 for D=128 (matches attn::prefill dispatch)
+            const int prefill_W     = (D == 64) ? 2 : 1;
+            const int PREFILL_ALIGN = prefill_W * _Br;
+            if (T >= PREFILL_ALIGN && T % PREFILL_ALIGN == 0) {
+                // Repack Q: [T, nQH*D] → [nQH, T, D]
+                hipLaunchKernelGGL(repack_kernel, grid1d((size_t)T*c.n_heads*D),
+                    dim3(256), 0, 0, d_q,  d_qh, T, c.n_heads,    D, 0);
+                // Repack K: [T, nKVH*D] → [nKVH, T, D]
+                hipLaunchKernelGGL(repack_kernel, grid1d((size_t)T*c.n_kv_heads*D),
+                    dim3(256), 0, 0, d_k,  d_kh, T, c.n_kv_heads, D, 0);
+                // Repack V: [T, nKVH*D] → [nKVH, T, D]
+                hipLaunchKernelGGL(repack_kernel, grid1d((size_t)T*c.n_kv_heads*D),
+                    dim3(256), 0, 0, d_v,  d_vh, T, c.n_kv_heads, D, 0);
+
+                attn::PrefillCfg pc{D, T, T, c.n_heads, c.n_kv_heads, 1, /*causal*/1};
+                attn::prefill(d_qh, d_kh, d_vh, d_oh, pc);
+
+                // Repack O: [nQH, T, D] → [T, nQH*D]  (= d_attn_tok token-major)
+                hipLaunchKernelGGL(repack_kernel, grid1d((size_t)T*c.n_heads*D),
+                    dim3(256), 0, 0, d_oh, d_attn_tok, T, c.n_heads, D, 1);
+            } else {
+                // Fallback: per-token decode_dme (handles any T)
+                for (int q = 0; q < T; ++q){
+                    int Nkeys = pos0 + q + 1;
+                    const __half* q_in  = d_q       + (size_t)q*qd;
+                    __half*       q_out = d_attn_tok + (size_t)q*qd;
+                    attn::DecodeDmeCfg dc{D, Nkeys, c.n_heads, c.n_kv_heads, max_seq_};
+                    attn::decode_dme(q_in, kv_.K_layer(li,0), kv_.V_layer(li,0), q_out, dc);
+                }
             }
 
             // 6. O-proj via rocBLAS: fp16 attn_out → float d_oproj; residual
