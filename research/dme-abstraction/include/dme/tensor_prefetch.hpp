@@ -35,7 +35,9 @@
 //   }
 //
 // For the KV-cache layout [n_heads, max_seq, D] used in the cdna3 runtime,
-// use prefetch_tile2d_strided_fp16 with stride_row = max_seq * D / D = max_seq.
+// use prefetch_tile2d_fp16 — within a single head, key positions are contiguous
+// (stride between consecutive keys = D, equal to kCols). stride_kv = max_seq is
+// only the head-to-head stride, not the key-to-key stride within a head.
 // ---------------------------------------------------------------------------
 #pragma once
 

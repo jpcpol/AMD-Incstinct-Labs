@@ -4,13 +4,17 @@
 // Drop-in upgrade of fa_decode_kernel.hpp that:
 //   1. Accepts KV-cache with stride_kv (= max_seq) instead of contiguous N×D.
 //      Eliminates the pack_kv_kernel round-trip in session.hpp.
-//   2. Uses dme::prefetch_tile2d_strided_fp16 to async-load the next K/V tile
+//   2. Uses dme::prefetch_tile2d_fp16 to async-load the next K/V tile
 //      from HBM while computing the dot-product on the current tile.
 //
 // Layout contract (same as cdna3::runtime::KVCache):
-//   K[kvhead, max_seq, D]   stride_kv = max_seq
+//   K[kvhead, max_seq, D]   stride_kv = max_seq (head-to-head stride only)
 //   V[kvhead, max_seq, D]   stride_kv = max_seq
 //   Caller passes K_layer(li, 0) — pointer to element [kvhead=0, pos=0, d=0].
+//
+// Key insight: within a single KV head, positions k0..k0+kBc-1 are stored
+// contiguously as Kh[k0*D .. (k0+kBc)*D-1]. The packed prefetch_tile2d_fp16
+// is correct; stride_kv only appears in the per-head base pointer calculation.
 //
 // DME tiling:
 //   Tile size: kBc keys per tile (= 64, one wave width in key dimension).
@@ -120,8 +124,8 @@ __global__ void fa_decode_dme_kernel(
         {
             const __half* Ksrc0 = Kh + (size_t)k0 * D;
             const __half* Vsrc0 = Vh + (size_t)k0 * D;
-            dme::prefetch_tile2d_strided_fp16<kBc, D>(Ksrc0, K_buf[0], c.stride_kv, tid, nthreads);
-            dme::prefetch_tile2d_strided_fp16<kBc, D>(Vsrc0, V_buf[0], c.stride_kv, tid, nthreads);
+            dme::prefetch_tile2d_fp16<kBc, D>(Ksrc0, K_buf[0], tid, nthreads);
+            dme::prefetch_tile2d_fp16<kBc, D>(Vsrc0, V_buf[0], tid, nthreads);
             dme::wait();
             __syncthreads();
         }
@@ -140,8 +144,8 @@ __global__ void fa_decode_dme_kernel(
                 const int next_k0   = k0 + (jt + 1) * kBc;
                 const __half* Ksrc = Kh + (size_t)next_k0 * D;
                 const __half* Vsrc = Vh + (size_t)next_k0 * D;
-                dme::prefetch_tile2d_strided_fp16<kBc, D>(Ksrc, K_buf[nxt], c.stride_kv, tid, nthreads);
-                dme::prefetch_tile2d_strided_fp16<kBc, D>(Vsrc, V_buf[nxt], c.stride_kv, tid, nthreads);
+                dme::prefetch_tile2d_fp16<kBc, D>(Ksrc, K_buf[nxt], tid, nthreads);
+                dme::prefetch_tile2d_fp16<kBc, D>(Vsrc, V_buf[nxt], tid, nthreads);
             }
 
             // Compute Q · K_buf[cur] + online softmax
