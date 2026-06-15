@@ -14,6 +14,10 @@
 // directly with its strided layout [n_kv_heads, max_seq, D]. Eliminates the O(T²)
 // pack_kv_kernel round-trip that was copying cache rows into a contiguous buffer.
 //
+// rocBLAS GEMMs (C7): all 7 GEMMs per layer now use rocBLAS gemm_ex (f16 weights,
+// f32 compute) via RocblasHandle. Replaces the naive tile-GEMM kernels in forward.hpp
+// for Q/K/V/O projections and gate/up/down MLP — lm_head stays naive (once per step).
+//
 // ## Usage
 //   cdna3::runtime::Session sess("/tmp/qwen25_1b", /*max_seq*/4096);
 //   auto out = sess.generate(input_ids, {/*max_new_tokens*/256});
@@ -29,6 +33,7 @@
 #include "model_loader.hpp"
 #include "kv_cache.hpp"
 #include "forward.hpp"
+#include "rocblas_gemm.hpp"   // RocblasHandle — rocBLAS GEMM wrappers
 
 namespace cdna3 {
 namespace runtime {
@@ -42,6 +47,7 @@ class Session {
     ModelLoader loader_;
     const ModelWeights* w_ = nullptr;
     KVCache kv_;
+    RocblasHandle rblas_;
     int max_seq_;
 
     // scratch device buffers (allocated for the widest stage: prefill of prompt)
@@ -121,22 +127,22 @@ class Session {
         const auto& c = w_->cfg;
         int H=c.hidden, F=c.ffn_dim, D=c.head_dim;
         int qd=c.n_heads*D, kvd=c.n_kv_heads*D;
-        dim3 tb(16,16);
 
-        // float hidden → fp16 QKV (±bias for Qwen2)
-        auto gemm_qkv=[&](const __half* W, const __half* B, __half* Y, int N, int K){
-            dim3 gr((N+15)/16,(T+15)/16);
-            hipLaunchKernelGGL(gemm_f32in_f16out_bias_kernel,gr,tb,0,0,d_norm,W,B,Y,T,N,K);
+        // QKV: float norm[T,H] × Wq[qd,H]^T → __half out[T,qd] + bias[qd]
+        auto gemm_qkv=[&](const __half* W, const __half* B, __half* Y, int N){
+            rblas_.gemm_f32_f16w_f16out(d_norm, W, Y, T, N, H);
+            // fused bias: Y[i] += B[i%N]
+            int elems = T * N;
+            hipLaunchKernelGGL(bias_add_store_f16_kernel,
+                dim3((elems+255)/256), dim3(256), 0, 0, Y, B, T, N);
         };
-        // float hidden → float MLP (gate/up/down)
+        // MLP: float X[M,K] × W[N,K]^T → float Y[M,N]
         auto gemm_mlp=[&](const __half* W, const float* X, float* Y, int M, int N, int K){
-            dim3 gr((N+15)/16,(M+15)/16);
-            hipLaunchKernelGGL(gemm_f32in_f32out_kernel,gr,tb,0,0,X,W,Y,M,N,K);
+            rblas_.gemm_f32_f16w_f32out(X, W, Y, M, N, K);
         };
-        // fp16 attn_out → float O-proj
-        auto gemm_oproj=[&](const __half* W, int N, int K){
-            dim3 gr((N+15)/16,(T+15)/16);
-            hipLaunchKernelGGL(gemm_f16in_f32out_kernel,gr,tb,0,0,d_attn_tok,W,d_oproj,T,N,K);
+        // O-proj: __half attn_out[T,qd] × Wo[H,qd]^T → float d_oproj[T,H]
+        auto gemm_oproj=[&](const __half* W){
+            rblas_.gemm_f16_f16w_f32out(d_attn_tok, W, d_oproj, T, H, qd);
         };
 
         fill_rope(pos0, T);
@@ -147,10 +153,10 @@ class Session {
             // 1. attn RMSNorm: float hidden → float norm
             hipLaunchKernelGGL(rmsnorm_f32_kernel,dim3(T),dim3(256),0,0,d_hidden,L.norm_attn,d_norm,T,H,1e-6f);
 
-            // 2. QKV projections: float norm → fp16 Q/K/V (±Qwen2 bias)
-            gemm_qkv(L.Wq,L.bq,d_q, qd, H);
-            gemm_qkv(L.Wk,L.bk,d_k, kvd,H);
-            gemm_qkv(L.Wv,L.bv,d_v, kvd,H);
+            // 2. QKV projections via rocBLAS: float norm → fp16 Q/K/V + bias
+            gemm_qkv(L.Wq, L.bq, d_q,  qd);
+            gemm_qkv(L.Wk, L.bk, d_k,  kvd);
+            gemm_qkv(L.Wv, L.bv, d_v,  kvd);
 
             // 3. RoPE in-place on fp16 Q and K
             hipLaunchKernelGGL(rope_kernel,grid1d((size_t)T*c.n_heads*D),dim3(256),0,0,d_q,d_cos,d_sin,T,c.n_heads,D);
@@ -160,8 +166,6 @@ class Session {
             append_kv(li, T, pos0);
 
             // 5. attention via decode_dme: reads cache directly (no pack_kv round-trip).
-            //    K/V layout in cache: [n_kv_heads, max_seq, D] with stride_kv = max_seq.
-            //    One call per query position (causal: query q sees Nkeys = pos0+q+1 keys).
             for (int q = 0; q < T; ++q){
                 int Nkeys = pos0 + q + 1;
                 const __half* q_in  = d_q       + (size_t)q*qd;
@@ -170,18 +174,18 @@ class Session {
                 attn::decode_dme(q_in, kv_.K_layer(li,0), kv_.V_layer(li,0), q_out, dc);
             }
 
-            // 6. O projection: fp16 attn_out → float d_oproj; residual add into float hidden
-            gemm_oproj(L.Wo, H, qd);
+            // 6. O-proj via rocBLAS: fp16 attn_out → float d_oproj; residual
+            gemm_oproj(L.Wo);
             hipLaunchKernelGGL(add_f32_kernel,grid1d((size_t)T*H),dim3(256),0,0,d_hidden,d_oproj,(size_t)T*H);
 
             // 7. MLP RMSNorm: float hidden → float norm
             hipLaunchKernelGGL(rmsnorm_f32_kernel,dim3(T),dim3(256),0,0,d_hidden,L.norm_mlp,d_norm,T,H,1e-6f);
 
-            // 8. gate/up: float norm → float; silu-mul in float; down: float → float; residual
-            gemm_mlp(L.Wgate,d_norm,d_gate,T,F,H);
-            gemm_mlp(L.Wup,  d_norm,d_up,  T,F,H);
+            // 8. gate/up via rocBLAS: float norm → float; silu-mul; down; residual
+            gemm_mlp(L.Wgate, d_norm, d_gate, T, F, H);
+            gemm_mlp(L.Wup,   d_norm, d_up,   T, F, H);
             hipLaunchKernelGGL(silu_mul_f32_kernel,grid1d((size_t)T*F),dim3(256),0,0,d_gate,d_up,(size_t)T*F);
-            gemm_mlp(L.Wdown,d_gate,d_mlp,T,H,F);
+            gemm_mlp(L.Wdown, d_gate, d_mlp,  T, H, F);
             hipLaunchKernelGGL(add_f32_kernel,grid1d((size_t)T*H),dim3(256),0,0,d_hidden,d_mlp,(size_t)T*H);
         }
 
