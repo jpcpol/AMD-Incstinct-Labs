@@ -75,34 +75,33 @@ int main(int argc, char** argv){
     printf("| prompt_len | TTFT median (ms) | TTFT P95 (ms) |\n");
     printf("|------------|-----------------|---------------|\n");
 
-    for (int pi = 0; pi < n_prompt_lens; ++pi){
-        int plen = prompt_lens[pi];
-        auto prompt = make_prompt(plen);
-
+    {
+        // One session for all TTFT configs; generate() resets kv_.len each call.
         cdna3::runtime::Session sess(model_dir, /*max_seq*/512);
         cdna3::runtime::GenerateCfg cfg;
         cfg.max_new_tokens = N_GEN_ZERO;
         cfg.eos_token_id   = -1;
 
-        // warm-up
-        for (int w = 0; w < TTFT_WARM; ++w){
-            sess.generate(prompt, cfg);
+        for (int pi = 0; pi < n_prompt_lens; ++pi){
+            int plen = prompt_lens[pi];
+            auto prompt = make_prompt(plen);
+
+            for (int w = 0; w < TTFT_WARM; ++w) sess.generate(prompt, cfg);
+
+            std::vector<double> times;
+            times.reserve(TTFT_REPS);
+            for (int r = 0; r < TTFT_REPS; ++r){
+                double t0 = now_ms();
+                sess.generate(prompt, cfg);
+                double t1 = now_ms();
+                times.push_back(t1 - t0);
+            }
+
+            double med = median(times);
+            std::sort(times.begin(), times.end());
+            double p95 = times[(size_t)(0.95 * times.size())];
+            printf("| %10d | %15.2f | %13.2f |\n", plen, med, p95);
         }
-
-        std::vector<double> times;
-        times.reserve(TTFT_REPS);
-        for (int r = 0; r < TTFT_REPS; ++r){
-            double t0 = now_ms();
-            sess.generate(prompt, cfg);
-            double t1 = now_ms();
-            times.push_back(t1 - t0);
-        }
-
-        double med = median(times);
-        std::sort(times.begin(), times.end());
-        double p95 = times[(size_t)(0.95 * times.size())];
-
-        printf("| %10d | %15.2f | %13.2f |\n", plen, med, p95);
     }
 
     // -------------------------------------------------------------------------
@@ -151,19 +150,16 @@ int main(int argc, char** argv){
 
     // -------------------------------------------------------------------------
     // TTFT breakdown: prefill vs first decode step (5-token prompt)
+    // Reuses sess_tps (already warm, same model).
     // -------------------------------------------------------------------------
     printf("## TTFT breakdown (prompt_len=5)\n\n");
 
-    const int plen5 = 5;
-    auto prompt5 = make_prompt(plen5);
-    cdna3::runtime::Session sess5(model_dir, 512);
-
-    // time prefill+decode(1) = full TTFT
+    auto prompt5 = make_prompt(PROMPT_LEN_TPS);
     cdna3::runtime::GenerateCfg cfg1; cfg1.max_new_tokens=1; cfg1.eos_token_id=-1;
-    for (int w=0;w<2;++w) sess5.generate(prompt5,cfg1);
+    for (int w=0;w<2;++w) sess_tps.generate(prompt5,cfg1);
     std::vector<double> ttft5;
     for (int r=0;r<TTFT_REPS;++r){
-        double t0=now_ms(); sess5.generate(prompt5,cfg1); double t1=now_ms();
+        double t0=now_ms(); sess_tps.generate(prompt5,cfg1); double t1=now_ms();
         ttft5.push_back(t1-t0);
     }
 
