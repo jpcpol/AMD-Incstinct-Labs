@@ -1,25 +1,21 @@
 // ---------------------------------------------------------------------------
 // cdna3/runtime/rocblas_gemm.hpp — rocBLAS GEMM wrappers for the layer loop.
 //
-// Replaces the naive tile-GEMM kernels in session.hpp with rocBLAS calls.
-// All GEMMs in the layer loop are mixed-precision:
-//   activations = float (fp32-acc, C4 hardening)
-//   weights     = __half (fp16, loaded from model)
-//   accumulation= float (rocblas_compute_type_f32)
+// All 7 GEMMs per layer use rocBLAS gemm_ex. The supported mixed-precision
+// combination in rocBLAS 5.2 (ROCm 7.2) is:
+//   a_type = b_type = f16_r,  c_type = d_type = f32_r,  compute_type = f32_r
 //
-// Row-major ↔ col-major identity:
-//   C[M,N] = A[M,K] × B[K,N]   (row-major)
-//   Cᵀ[N,M] = Bᵀ[N,K] × Aᵀ[K,M]  (col-major, what rocBLAS sees)
-// So we call: gemm(B, A) with m=N, n=M, k=K, leading dims lda=N, ldb=K, ldc=N.
+// Our activations are float (fp32-acc hardening, C4). We convert them to fp16
+// via a cast kernel before each GEMM call. The conversion is cheap (~1% of
+// GEMM time) and preserves the fp32 accumulation path within the GEMM itself.
 //
-// Bias add after GEMM: rocBLAS gemm_ex does not support fused bias.
-// We add a separate elementwise kernel for QKV bias (only those 3 projections
-// have bias in Qwen2).
+// Row-major → col-major identity:
+//   Want:  C[M,N] = A[M,K] × W[N,K]ᵀ   (row-major)
+//   Equiv: C^T[N,M] = W[N,K] × A^T[K,M]  (col-major, what rocBLAS sees)
+//   Call:  gemm(transA=N, transB=N, m=N, n=M, k=K,
+//               W, lda=N,  A, ldb=K,  C, ldc=N)
 //
-// Usage:
-//   RocblasHandle rblas;
-//   // C[M,N] = A[M,K] * W[N,K]^T  (W stored row-major as [N,K])
-//   rblas.sgemm_f32_f16w(A, W, C, M, N, K);
+// Bias: rocBLAS gemm_ex doesn't support fused bias. Added as a separate kernel.
 // ---------------------------------------------------------------------------
 #pragma once
 #include <rocblas/rocblas.h>
@@ -32,16 +28,30 @@ namespace cdna3 {
 namespace runtime {
 
 // ---------------------------------------------------------------------------
-// Bias add kernel: Y[m, n] += B[n]  (broadcast bias over M rows)
+// cast_f32_to_f16_kernel: tmp_f16[i] = __float2half(src_f32[i])
+// Used to down-cast float activations to fp16 before rocBLAS GEMM.
 // ---------------------------------------------------------------------------
-__global__ void bias_add_f16_kernel(float* Y, const __half* B, int M, int N)
+__global__ void cast_f32_to_f16_kernel(const float* src, __half* dst, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+// ---------------------------------------------------------------------------
+// bias_add_f32_kernel: Y[m,n] += B[n]  (broadcast fp16 bias into float Y)
+// Used after MLP GEMMs (output is float, bias is fp16).
+// ---------------------------------------------------------------------------
+__global__ void bias_add_f32_kernel(float* Y, const __half* B, int M, int N)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < M * N) Y[idx] += __half2float(B[idx % N]);
 }
 
-// Same but output is __half (used for QKV: float-acc GEMM then cast+bias)
-__global__ void bias_add_store_f16_kernel(__half* Y, const __half* B, int M, int N)
+// ---------------------------------------------------------------------------
+// bias_add_f16_kernel: Y[m,n] += B[n]  (fp16 in/out, fp16 bias)
+// Used after QKV GEMMs (output is fp16).
+// ---------------------------------------------------------------------------
+__global__ void bias_add_f16_kernel(__half* Y, const __half* B, int M, int N)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < M * N)
@@ -49,10 +59,13 @@ __global__ void bias_add_store_f16_kernel(__half* Y, const __half* B, int M, int
 }
 
 // ---------------------------------------------------------------------------
-// RocblasHandle — RAII wrapper, one per Session.
+// RocblasHandle — RAII wrapper. One per Session.
+// Holds a temporary fp16 scratch buffer for activation down-casting.
 // ---------------------------------------------------------------------------
 class RocblasHandle {
-    rocblas_handle h_ = nullptr;
+    rocblas_handle h_   = nullptr;
+    __half*        tmp_ = nullptr;   // device scratch for fp16 activations
+    int            cap_ = 0;         // capacity in elements
 
     static void check(rocblas_status s, const char* where){
         if (s != rocblas_status_success){
@@ -62,12 +75,21 @@ class RocblasHandle {
         }
     }
 
+    // Ensure tmp_ can hold n fp16 elements.
+    void ensure_tmp(int n){
+        if (n <= cap_) return;
+        if (tmp_) hipFree(tmp_);
+        hipMalloc(&tmp_, (size_t)n * 2);
+        cap_ = n;
+    }
+
 public:
     RocblasHandle(){
         check(rocblas_create_handle(&h_), "create_handle");
     }
     ~RocblasHandle(){
-        if (h_) rocblas_destroy_handle(h_);
+        if (h_)   rocblas_destroy_handle(h_);
+        if (tmp_) hipFree(tmp_);
     }
     RocblasHandle(const RocblasHandle&)            = delete;
     RocblasHandle& operator=(const RocblasHandle&) = delete;
@@ -75,60 +97,68 @@ public:
     rocblas_handle get() const { return h_; }
 
     // -------------------------------------------------------------------------
-    // gemm_f32_f16w_f32out
+    // gemm_f32act_f16w_f32out
     //
-    // Computes C[M, N] = A[M, K] × W[N, K]ᵀ  →  float output.
+    // C[M,N] = A[M,K] × W[N,K]ᵀ    A=float activations, W=fp16 weights, C=float
     //
-    // A : float   [M, K] row-major
-    // W : __half  [N, K] row-major  (weight matrix, transposed in GEMM)
-    // C : float   [M, N] row-major
+    // Steps: (1) cast A→fp16 scratch, (2) rocBLAS gemm_ex f16+f16→f32.
     //
-    // rocBLAS sees col-major:  C'[N,M] = W'[N,K] × A'[K,M]
-    //   transA=N (W already N×K), transB=N (A as K×M = Aᵀ col-major)
-    //   Wait — re-derive carefully:
-    //     Row-major C[M,N]=A[M,K]*W^T[K,N]  ↔  col-major C^T[N,M]=W[N,K]*A^T[K,M]
-    //   So: op(W)=no-trans (m=N, k=K), op(A^T)=no-trans (k=K, n=M)
-    //   rocBLAS: gemm(transA=N, transB=N, m=N, n=M, k=K, alpha, W, lda=N, A, ldb=K, beta, C, ldc=N)
-    //
-    // Compute type: f32 (accumulate in float even though B is f16).
+    // rocBLAS col-major call:
+    //   C^T[N,M] = W[N,K] × A^T[K,M]
+    //   gemm(N,N, m=N, n=M, k=K, W, lda=N, A_f16, ldb=K, C, ldc=N)
     // -------------------------------------------------------------------------
-    void gemm_f32_f16w_f32out(
+    void gemm_f32act_f16w_f32out(
         const float* A, const __half* W, float* C,
         int M, int N, int K,
         hipStream_t stream = nullptr)
     {
         if (stream) rocblas_set_stream(h_, stream);
 
+        // Cast float A[M,K] → fp16 tmp[M,K]
+        ensure_tmp(M * K);
+        int elems_a = M * K;
+        hipLaunchKernelGGL(cast_f32_to_f16_kernel,
+            dim3((elems_a + 255) / 256), dim3(256), 0, stream,
+            A, tmp_, elems_a);
+
         float alpha = 1.f, beta = 0.f;
         check(rocblas_gemm_ex(
             h_,
-            rocblas_operation_none,      // transA: W is [N,K], use as-is
-            rocblas_operation_none,      // transB: A^T is [K,M], use as-is
-            N, M, K,                     // m, n, k
+            rocblas_operation_none,       // W [N,K] no-trans
+            rocblas_operation_none,       // A^T [K,M] no-trans
+            N, M, K,                      // m, n, k
             &alpha,
-            W,    rocblas_datatype_f16_r, N,   // a, a_type, lda
-            A,    rocblas_datatype_f32_r, K,   // b, b_type, ldb
+            W,    rocblas_datatype_f16_r, N,   // A matrix (= W[N,K])
+            tmp_, rocblas_datatype_f16_r, K,   // B matrix (= A^T[K,M])
             &beta,
-            C,    rocblas_datatype_f32_r, N,   // c, c_type, ldc
-            C,    rocblas_datatype_f32_r, N,   // d, d_type, ldd
-            rocblas_datatype_f32_r,  // compute type (f32 accumulation)
+            C,    rocblas_datatype_f32_r, N,   // C matrix
+            C,    rocblas_datatype_f32_r, N,   // D = C
+            rocblas_datatype_f32_r,            // compute type: f32
             rocblas_gemm_algo_standard, 0, 0
-        ), "gemm_f32_f16w_f32out");
+        ), "gemm_f32act_f16w_f32out");
     }
 
     // -------------------------------------------------------------------------
-    // gemm_f32_f16w_f16out
+    // gemm_f32act_f16w_f16out
     //
-    // Same GEMM but stores result as __half.
-    // Used for QKV projections (output is fp16 for attention).
-    // Bias (if any) must be added separately after this call.
+    // C[M,N] = A[M,K] × W[N,K]ᵀ    A=float, W=fp16, C=fp16.
+    // Used for QKV projections (attention expects fp16 input).
+    //
+    // rocBLAS f16+f16→f16 with compute=f32:
+    //   a=b=f16, c=d=f16, compute=f32 is supported.
     // -------------------------------------------------------------------------
-    void gemm_f32_f16w_f16out(
+    void gemm_f32act_f16w_f16out(
         const float* A, const __half* W, __half* C,
         int M, int N, int K,
         hipStream_t stream = nullptr)
     {
         if (stream) rocblas_set_stream(h_, stream);
+
+        ensure_tmp(M * K);
+        int elems_a = M * K;
+        hipLaunchKernelGGL(cast_f32_to_f16_kernel,
+            dim3((elems_a + 255) / 256), dim3(256), 0, stream,
+            A, tmp_, elems_a);
 
         float alpha = 1.f, beta = 0.f;
         check(rocblas_gemm_ex(
@@ -138,22 +168,23 @@ public:
             N, M, K,
             &alpha,
             W,    rocblas_datatype_f16_r, N,
-            A,    rocblas_datatype_f32_r, K,
+            tmp_, rocblas_datatype_f16_r, K,
             &beta,
             C,    rocblas_datatype_f16_r, N,
             C,    rocblas_datatype_f16_r, N,
-            rocblas_datatype_f32_r,  // compute type (f32 accumulation)
+            rocblas_datatype_f32_r,
             rocblas_gemm_algo_standard, 0, 0
-        ), "gemm_f32_f16w_f16out");
+        ), "gemm_f32act_f16w_f16out");
     }
 
     // -------------------------------------------------------------------------
-    // gemm_f16_f16w_f32out
+    // gemm_f16act_f16w_f32out
     //
-    // C[M,N] = A[M,K] × W[N,K]ᵀ  with A in fp16, output in float.
-    // Used for O-projection: attn output (fp16) × Wo (fp16) → float residual.
+    // C[M,N] = A[M,K] × W[N,K]ᵀ    A=fp16, W=fp16, C=float.
+    // Used for O-projection: fp16 attn output → float residual.
+    // No cast needed (A is already fp16).
     // -------------------------------------------------------------------------
-    void gemm_f16_f16w_f32out(
+    void gemm_f16act_f16w_f32out(
         const __half* A, const __half* W, float* C,
         int M, int N, int K,
         hipStream_t stream = nullptr)
@@ -172,9 +203,9 @@ public:
             &beta,
             C,    rocblas_datatype_f32_r, N,
             C,    rocblas_datatype_f32_r, N,
-            rocblas_datatype_f32_r,  // compute type (f32 accumulation)
+            rocblas_datatype_f32_r,
             rocblas_gemm_algo_standard, 0, 0
-        ), "gemm_f16_f16w_f32out");
+        ), "gemm_f16act_f16w_f32out");
     }
 };
 

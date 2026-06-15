@@ -128,21 +128,20 @@ class Session {
         int H=c.hidden, F=c.ffn_dim, D=c.head_dim;
         int qd=c.n_heads*D, kvd=c.n_kv_heads*D;
 
-        // QKV: float norm[T,H] × Wq[qd,H]^T → __half out[T,qd] + bias[qd]
+        // QKV: float norm[T,H] × W[N,H]^T → fp16 out[T,N] + bias[N]
         auto gemm_qkv=[&](const __half* W, const __half* B, __half* Y, int N){
-            rblas_.gemm_f32_f16w_f16out(d_norm, W, Y, T, N, H);
-            // fused bias: Y[i] += B[i%N]
+            rblas_.gemm_f32act_f16w_f16out(d_norm, W, Y, T, N, H);
             int elems = T * N;
-            hipLaunchKernelGGL(bias_add_store_f16_kernel,
+            hipLaunchKernelGGL(bias_add_f16_kernel,
                 dim3((elems+255)/256), dim3(256), 0, 0, Y, B, T, N);
         };
         // MLP: float X[M,K] × W[N,K]^T → float Y[M,N]
         auto gemm_mlp=[&](const __half* W, const float* X, float* Y, int M, int N, int K){
-            rblas_.gemm_f32_f16w_f32out(X, W, Y, M, N, K);
+            rblas_.gemm_f32act_f16w_f32out(X, W, Y, M, N, K);
         };
-        // O-proj: __half attn_out[T,qd] × Wo[H,qd]^T → float d_oproj[T,H]
+        // O-proj: fp16 attn_out[T,qd] × Wo[H,qd]^T → float d_oproj[T,H]
         auto gemm_oproj=[&](const __half* W){
-            rblas_.gemm_f16_f16w_f32out(d_attn_tok, W, d_oproj, T, H, qd);
+            rblas_.gemm_f16act_f16w_f32out(d_attn_tok, W, d_oproj, T, H, qd);
         };
 
         fill_rope(pos0, T);
