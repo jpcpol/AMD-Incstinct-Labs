@@ -13,22 +13,22 @@
 //   H-MW2: SQ_INSTS_VMEM_RD drops ≥(1-1/W) vs W independent blocks.
 //   H-MW3: gap vs SDPA narrows vs 2-C measurement (8.5-15×).
 //
-// LDS budget per configuration (64 KB CU limit):
-//   W=1 D=64 : K+V=8KB  + per-wave(S+P+O+m+l)=13KB ×1 = 21 KB  [OK]
-//   W=2 D=64 : K+V=8KB  + 13KB×2 = 34 KB  [OK]
-//   W=4 D=64 : K+V=8KB  + 13KB×4 = 60 KB  [OK, tight]
-//   W=1 D=128: K+V=32KB + 26KB×1 = 58 KB  [OK, tight]
-//   W=2 D=128: K+V=32KB + 26KB×2 = 84 KB  [OVERFLOW — skipped]
-//   W=4 D=128: K+V=32KB + 26KB×4 = 136KB  [OVERFLOW — skipped]
+// LDS budget per configuration (64 KB CU limit, S_lds=half since 2026-06-19):
+//   W=1 D=64 : 28800 B  = 28.1 KB  [OK]
+//   W=2 D=64 : 33152 B  = 32.4 KB  [OK]
+//   W=4 D=64 : 57856 B  = 56.5 KB  [OK]
+//   W=1 D=128: 49152 B  = 48.0 KB  [OK]
+//   W=2 D=128: ~85 KB               [OVERFLOW — skipped]
+//   W=4 D=128: ~153 KB              [OVERFLOW — skipped]
 //
-// Note on LDS calculation (per wave, D=128):
-//   S_lds[Br*Bc*f32] = 16*64*4 =  4096 B
+// Note on LDS per-wave (D=128, S_lds now half):
+//   S_lds[Br*Bc*f16] = 16*64*2 =  2048 B  ← was f32 (4096B), halved
 //   P_lds[Br*Bc*f16] = 16*64*2 =  2048 B
 //   O_lds[Br*D *f32] = 16*128*4=  8192 B
 //   Q_lds[Br*D *f16] = 16*128*2=  4096 B
 //   m_lds+l_lds[Br]  = 16*4*2  =   128 B
-//   Total per wave   =          18560 B ≈ 18 KB
-// W=2 D=128: shared K+V=32KB + 2×18KB = 68KB  [OVERFLOW — skip]
+//   Total per wave   =          16512 B ≈ 16 KB
+// W=2 D=128: shared K+V=32KB + 2×16KB = 65KB  [OVERFLOW — skip]
 //
 // Compile (from research/flash-attention-mi300x/):
 //   hipcc -O3 --offload-arch=gfx942 -std=c++17 \

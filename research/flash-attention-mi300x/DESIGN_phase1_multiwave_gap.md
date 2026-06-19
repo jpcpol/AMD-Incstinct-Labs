@@ -39,9 +39,9 @@ Configurations:
 - `fa_multiwave W=4 D=64`  — max valid W at D=64 (60KB LDS, tight)
 - `F.sdpa` (fused ROCm) — fresh measurement to check if SDPA changed since 2-C
 
-LDS budget analysis (confirmed in DESIGN_multiwave_fa.md):
+LDS budget analysis (S_lds now half — commit after audit):
 - W=2 D=128 = 68KB → OVERFLOW, not tested
-- W=4 D=64  = 60KB → valid (tight)
+- W=4 D=64  = 57856B = 56.5KB → valid (S_lds half saves 8192B vs prior 66KB)
 
 ---
 
@@ -86,47 +86,39 @@ m_lds[Br    * sizeof(float)]= 16*4    bytes =   64 B
 l_lds[Br    * sizeof(float)]= 16*4    bytes =   64 B
 ```
 
-Total(D=64, W=4):
-- Shared: 2*64*64*2 = 16384 B
-- Per wave: (16*64*2 + 4096 + 2048 + 16*64*4 + 128) = 2048+4096+2048+4096+128 = 12416 B
-- ×4 waves: 49664 B
-- Total: 16384 + 49664 = **66048 B** — slightly over 64KB
+**Fix applied (2026-06-19): S_lds downcast from float → half.**
 
-Wait — this needs re-checking. The kernel uses `__shared__ float O_lds[W][_Br*D]` etc.
-with W as a template parameter, so all W waves' arrays are allocated at once. Let me
-recount for D=64, W=4:
+`S_lds` stores Q·Kᵀ scores before softmax. Keeping them in half (range ±65504,
+precision ~0.1% relative) is sufficient — the softmax immediately converts back to
+float for the exponential. This saves 8192 B at W=4,D=64.
+
+Updated LDS budget for D=64, W=4:
 
 ```
 K_lds[64*64] half  = 8192 B
 V_lds[64*64] half  = 8192 B
-Q_lds[4][16*64] half = 4*2048 = 8192 B
-S_lds[4][16*64] f32  = 4*4096 = 16384 B
-P_lds[4][16*64] half = 4*2048 = 8192 B
+Q_lds[4][16*64] half = 4*2048 =  8192 B
+S_lds[4][16*64] half = 4*2048 =  8192 B  ← was f32 (16384B), now half
+P_lds[4][16*64] half = 4*2048 =  8192 B
 O_lds[4][16*64] f32  = 4*4096 = 16384 B
-m_lds[4][16] f32     = 4*64   = 256 B
-l_lds[4][16] f32     = 4*64   = 256 B
-Total = 8192+8192+8192+16384+8192+16384+256+256 = 66048 B
+m_lds[4][16]    f32  = 4*64   =   256 B
+l_lds[4][16]    f32  = 4*64   =   256 B
+Total = 8192+8192+8192+8192+8192+16384+256+256 = 57856 B = 56.5 KB ✓
 ```
 
-**66048 B = 64.5 KB — marginally over 64 KB limit.**
+Valid configurations after fix:
 
-The kernel will likely fail with an LDS overflow error at W=4, D=64. The benchmark
-handles this gracefully (reports KERNEL ERROR and continues). The valid configurations
-are conservatively:
-- W=1, D=128: 8192+8192+2048+4096+2048+4096+64+64 = **26800 B** (×1) + shared 32768 = 59568 B ✓
-- W=2, D=64:  shared 16384 + 2×(2048+4096+2048+4096+64+64) = 16384+24832 = **41216 B** ✓
-- W=1, D=64:  shared 16384 + 1×12416 = **28800 B** ✓
-
-If W=4 D=64 fails, the benchmark documents it as an LDS overflow finding. The valid
-sweet spot for D=64 is W=2. For D=128, W=1 is the maximum.
-
-**Updated plan for VM session:** if W=4 fails, sweep {W=1, W=2} at D=64 and W=1 at D=128.
+- W=4, D=64:  **57856 B** = 56.5 KB ✓  (was 66048 B = 64.5 KB, OVERFLOW)
+- W=2, D=64:  shared 16384 + 2×(2048+2048+2048+4096+64+64) = **33152 B** ✓
+- W=1, D=128: shared 32768 + 1×(2048+2048+2048+8192+64+64) = **49152 B** ✓
 
 ---
 
 ## 5. VM session guion
 
 ```bash
+# --- Phase-1: multi-wave FA gap ---
+
 # Build
 cd /root/amd/research/flash-attention-mi300x
 hipcc -O3 --offload-arch=gfx942 -std=c++17 \
@@ -141,18 +133,33 @@ python3 bench_sdpa_baseline.py \
   --seqs 512,1024,2048,4096 --D 128 --nH 32 --nKV 8 \
   | tee /root/results_phase1_sdpa_mi300x.txt
 
-# rocprofv3 for H-MW2 (VMEM_RD) — one dispatch per config
-rocprofv3 --pmc SQ_INSTS_VMEM_RD,SQ_INSTS_LDS,SQ_INSTS_VALU \
+# rocprofv3: H-MW2 (VMEM_RD reuse) + occupancy (SQ_WAVES, BUSY_CU_CYCLES)
+rocprofv3 --pmc SQ_INSTS_VMEM_RD,SQ_INSTS_LDS,SQ_INSTS_VALU,SQ_WAVES,SQ_BUSY_CU_CYCLES \
   ./bench_multiwave_vs_sdpa \
   | tee /root/results_phase1_rocprof_mi300x.txt
+
+# --- Phase-2: GEMM batch=1 occupancy ---
+
+# Build
+hipcc -O3 --offload-arch=gfx942 -std=c++17 \
+  -lrocblas \
+  bench_gemm_batch1_vs_batched.hip -o bench_gemm_batch1
+
+# Run benchmark
+./bench_gemm_batch1 | tee /root/results_phase2_gemm_batch1_mi300x.txt
+
+# rocprofv3: occupancy counters for M=1 vs M=32
+rocprofv3 --pmc SQ_WAVES,SQ_BUSY_CU_CYCLES,SQ_VALU_INST_EXECUTED \
+  ./bench_gemm_batch1 \
+  | tee /root/results_phase2_gemm_rocprof_mi300x.txt
 ```
 
 After the session:
-1. Copy all three result files to `research/flash-attention-mi300x/results/`
-2. Compute gaps offline: `multiwave_us / sdpa_us` per seqLen
-3. Evaluate H-MW1/H-MW2/H-MW3
+1. Copy all result files to `research/flash-attention-mi300x/results/`
+2. Phase-1: compute gaps offline `multiwave_us / sdpa_us` per seqLen; evaluate H-MW1/H-MW2/H-MW3
+3. Phase-2: compute TFLOPS ratio M=1/M=32 (H-G1); check scaling linearity (H-G2); compare BW vs TF utilization (H-G3)
 4. Update paper §5.9 gap claim with measured number (currently "8.5–15×" from fa_robust)
-5. If H-MW3 shows substantial gap remains: proceed to Phase 2 analysis
+5. Update paper §5.10 with GEMM batch=1 occupancy finding
 
 ---
 

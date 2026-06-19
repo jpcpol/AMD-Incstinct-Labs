@@ -66,11 +66,11 @@ __global__ void fa_multiwave_kernel(const __half* __restrict__ Q, const __half* 
     __shared__ __half K_lds[_Bc*D];
     __shared__ __half V_lds[_Bc*D];
     __shared__ __half Q_lds[W][_Br*D];
-    __shared__ float  S_lds[W][_Br*_Bc];
+    __shared__ __half S_lds[W][_Br*_Bc];  // half saves 8192B at W=4,D=64 (66KB→58KB)
     __shared__ __half P_lds[W][_Br*_Bc];
     __shared__ float  O_lds[W][_Br*D];
-    __shared__ float  m_lds[W][_Br];   // per-row running max (in LDS: 64 lanes share)
-    __shared__ float  l_lds[W][_Br];   // per-row running sum
+    __shared__ float  m_lds[W][_Br];
+    __shared__ float  l_lds[W][_Br];
 
     for (int i=L; i<_Br*D; i+=64) Q_lds[wave][i] = Qblk[i];
     for (int i=L; i<_Br*D; i+=64) O_lds[wave][i] = 0.f;
@@ -114,7 +114,7 @@ __global__ void fa_multiwave_kernel(const __half* __restrict__ Q, const __half* 
                 int sc = jc * _MT + (L % _MT);
                 float s = acc[f] * scale;
                 if (c.causal){ int gq = qrow0+sr, gk = kv*_Bc+sc; if (gk > gq) s = -1e30f; }
-                S_lds[wave][sr*_Bc + sc] = s;
+                S_lds[wave][sr*_Bc + sc] = __float2half(s);
             }
         }
         __syncthreads();
@@ -123,7 +123,7 @@ __global__ void fa_multiwave_kernel(const __half* __restrict__ Q, const __half* 
         // Running (m,l) lives in LDS; lane 0 commits the scalar update and O rescale.
         #pragma unroll
         for (int row = 0; row < _Br; ++row){
-            float s    = S_lds[wave][row*_Bc + L];
+            float s    = __half2float(S_lds[wave][row*_Bc + L]);
             float rmax = reduce_max_bcast(s);
             float mold = m_lds[wave][row];
             float mnew = fmaxf(mold, rmax);
